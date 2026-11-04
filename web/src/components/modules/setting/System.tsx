@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'use-intl';
-import { Monitor, Globe, Clock, Shield, Filter, HelpCircle, X } from 'lucide-react';
+import { Monitor, Globe, Clock, Shield, Filter, HelpCircle, X, RotateCw, Loader2, Power } from 'lucide-react';
 import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { useSettingList, useSetSetting, SettingKey } from '@/api/setting';
+import {
+    useSettingList,
+    useSetSetting,
+    useRestartService,
+    waitForServiceReady,
+    SettingKey,
+} from '@/api/setting';
+import { ApiError } from '@/api/client';
 import { toast } from 'sonner';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
@@ -11,12 +19,14 @@ export function SettingSystem() {
     const t = useTranslations('setting');
     const { data: settings } = useSettingList();
     const setSetting = useSetSetting();
+    const restartService = useRestartService();
 
     const [proxyUrl, setProxyUrl] = useState('');
     const [statsSaveInterval, setStatsSaveInterval] = useState('');
     const [corsAllowOrigins, setCorsAllowOrigins] = useState('');
     const [corsInputValue, setCorsInputValue] = useState('');
     const [modelFilter, setModelFilter] = useState('');
+    const [restarting, setRestarting] = useState(false);
 
     const initialProxyUrl = useRef('');
     const initialStatsSaveInterval = useRef('');
@@ -119,6 +129,38 @@ export function SettingSystem() {
     const handleRemoveCorsOrigin = (originToRemove: string) => {
         const nextOrigins = corsAllowOriginsList.filter(origin => origin !== originToRemove);
         saveCorsAllowOrigins(nextOrigins);
+    };
+
+    // 重启流程: 先不带 force 试一次, 后端有在途请求会回 409, 交给用户确认后再强制。
+    const runRestart = async (force: boolean) => {
+        setRestarting(true);
+        try {
+            await restartService.mutateAsync(force);
+        } catch (err) {
+            setRestarting(false);
+            if (err instanceof ApiError && err.status === 409) {
+                toast.warning(err.message, {
+                    duration: 12000,
+                    action: {
+                        label: t('restart.force'),
+                        onClick: () => void runRestart(true),
+                    },
+                });
+                return;
+            }
+            toast.error(err instanceof Error ? err.message : String(err));
+            return;
+        }
+
+        toast.loading(t('restart.restarting'), { id: 'octopus-restart' });
+        const ready = await waitForServiceReady();
+        toast.dismiss('octopus-restart');
+        setRestarting(false);
+        if (ready) {
+            toast.success(t('restart.done'));
+        } else {
+            toast.error(t('restart.timeout'));
+        }
     };
 
     return (
@@ -242,6 +284,37 @@ export function SettingSystem() {
                         </div>
                     </PopoverContent>
                 </Popover>
+            </div>
+
+            {/* 重启服务 */}
+            <div className="flex items-center justify-between gap-4 border-t border-border/60 pt-4">
+                <div className="flex items-center gap-3">
+                    <Power className="h-5 w-5 text-muted-foreground" />
+                    <div className="space-y-0.5">
+                        <div className="flex items-center gap-1.5">
+                            <span className="text-sm font-medium">{t('restart.label')}</span>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <HelpCircle className="size-4 text-muted-foreground cursor-help" />
+                                </TooltipTrigger>
+                                <TooltipContent side="top" sideOffset={10} align="center">
+                                    {t('restart.hint')}
+                                </TooltipContent>
+                            </Tooltip>
+                        </div>
+                        <p className="text-xs text-muted-foreground">{t('restart.summary')}</p>
+                    </div>
+                </div>
+                <Button
+                    variant="outline"
+                    size="sm"
+                    className="rounded-xl"
+                    disabled={restarting}
+                    onClick={() => void runRestart(false)}
+                >
+                    {restarting ? <Loader2 className="size-4 animate-spin" /> : <RotateCw className="size-4" />}
+                    {restarting ? t('restart.restarting') : t('restart.button')}
+                </Button>
             </div>
         </div>
     );

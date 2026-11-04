@@ -163,6 +163,16 @@
             "placeholder": "Enter filter regex",
             "hint": "Applied along with the channel's own filter when fetching models (AND); empty means no filter"
         },
+        "restart": {
+            "label": "Restart service",
+            "button": "Restart now",
+            "restarting": "Restarting…",
+            "done": "Service restarted",
+            "timeout": "Restart timed out, please check the service manually",
+            "force": "Restart anyway",
+            "hint": "Runs the normal shutdown sequence first (stats flushed to the database, log bodies written, database closed), then restarts the process in place. In-flight requests are interrupted.",
+            "summary": "Only needed for settings read at startup"
+        },
         "saved": "Saved",
         "backup": {
             "title": "Backup / Restore",

@@ -388,6 +388,22 @@ func publishRequestLocked(request *RequestState) {
 	}
 }
 
+// ActiveCount 返回尚未结束的请求数量, 即还在转发中或正在向客户端吐流的那些。
+// 重启进程会掐断它们, 界面据此决定要不要先让用户确认。
+func ActiveCount() int {
+	mu.Lock()
+	defer mu.Unlock()
+
+	count := 0
+	for _, request := range requests {
+		switch request.Status {
+		case StatusRunning, StatusCommitted:
+			count++
+		}
+	}
+	return count
+}
+
 // OpenRequestStream 注册请求状态流连接, 返回按请求 ID 倒序的全部快照和后续增量通道。
 // 日志页不提供排序开关, 而 requests 是 map, 遍历顺序随机, 故顺序须由此处定稿。
 func OpenRequestStream() ([]RequestState, chan RequestState) {

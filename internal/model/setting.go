@@ -35,6 +35,19 @@ func DefaultSettings() []Setting {
 
 func (s *Setting) Validate() error {
 	switch s.Key {
+	case SettingKeyStatsSaveInterval:
+		// 非数字会让启动时的 SettingGetInt 失败、定时任务根本不注册; 0 或负数会让 Register 静默跳过。
+		minutes, err := strconv.Atoi(s.Value)
+		if err != nil {
+			return fmt.Errorf("stats save interval must be an integer")
+		}
+		if minutes <= 0 {
+			return fmt.Errorf("stats save interval must be greater than 0")
+		}
+		if minutes > 1440 {
+			return fmt.Errorf("stats save interval must not exceed 1440")
+		}
+		return nil
 	case SettingKeyModelInfoUpdateInterval:
 		_, err := strconv.Atoi(s.Value)
 		if err != nil {

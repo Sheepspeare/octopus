@@ -59,6 +59,49 @@ export function useSetSetting() {
 }
 
 /**
+ * 重启服务 Hook
+ *
+ * 后端先按正常退出流程收尾（统计落库、日志正文落盘、关库），再以同一可执行文件原地重启。
+ * 有在途请求时后端返回 409，需 force=true 才会强制重启。
+ *
+ * @example
+ * const restart = useRestartService();
+ * restart.mutate(false);
+ */
+export function useRestartService() {
+    return useMutation({
+        mutationFn: (force: boolean) =>
+            apiRequest<null>(`/api/v1/setting/restart${force ? '?force=true' : ''}`, { method: 'POST' }),
+    });
+}
+
+/**
+ * 轮询等待服务恢复，超时返回 false。
+ * 重启期间连接会被重置，此时 fetch 抛的是网络错误而非 ApiError，故只把「服务有响应」当作恢复。
+ * 需要连续两次成功：旧进程在关闭过程中仍可能应答一次，只探一次容易误判成已恢复。
+ */
+export async function waitForServiceReady(timeoutMs = 30000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    let hits = 0;
+    while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        try {
+            await apiRequest<string>('/api/v1/update/now-version');
+            hits += 1;
+            if (hits >= 2) return true;
+        } catch (err) {
+            if (err instanceof ApiError) {
+                hits += 1;
+                if (hits >= 2) return true;
+            } else {
+                hits = 0;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * 数据库导入/导出
  */
 interface DBImportResult {

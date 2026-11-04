@@ -20,6 +20,7 @@ type taskEntry struct {
 var (
 	tasks   = make(map[string]*taskEntry)
 	tasksMu sync.RWMutex
+	running bool // RUN 是否已经为已注册任务起过协程; 之后补注册的任务需要自己拉起。
 )
 
 // Register 注册一个定时任务
@@ -44,7 +45,8 @@ func Register(name string, interval time.Duration, runOnStart bool, fn func()) {
 		fn:         fn,
 		runOnStart: runOnStart,
 		stopCh:     make(chan struct{}),
-		updateCh:   make(chan time.Duration),
+		// 带缓冲: Update 用非阻塞发送, 无缓冲时若 runTask 还没阻塞在 select 上就会把这次调整丢掉。
+		updateCh: make(chan time.Duration, 1),
 	}
 	log.Debugf("task %s registered with interval %v, runOnStart: %v", name, interval, runOnStart)
 }
@@ -77,13 +79,47 @@ func Update(name string, interval time.Duration) {
 	}
 }
 
+// Set 注册或调整一个定时任务: 未注册时按给定函数注册, 已注册时只改执行间隔。
+// 与 Update 的区别是允许在 RUN 之后补注册 —— 间隔来自设置项时, 启动时可能取不到合法值而没注册,
+// 之后用户在界面上改对了要能直接生效, 不必重启进程。
+func Set(name string, interval time.Duration, fn func()) {
+	tasksMu.Lock()
+	entry, exists := tasks[name]
+	if exists {
+		tasksMu.Unlock()
+		Update(name, interval)
+		return
+	}
+	if interval <= 0 {
+		tasksMu.Unlock()
+		log.Debugf("task %s not registered: interval is 0", name)
+		return
+	}
+	entry = &taskEntry{
+		name:     name,
+		interval: interval,
+		fn:       fn,
+		stopCh:   make(chan struct{}),
+		updateCh: make(chan time.Duration, 1),
+	}
+	tasks[name] = entry
+	started := running
+	tasksMu.Unlock()
+
+	log.Infof("task %s registered with interval %v", name, interval)
+	if started {
+		go runTask(entry)
+	}
+}
+
 // RUN 启动所有注册的任务
 func RUN() {
-	tasksMu.RLock()
+	tasksMu.Lock()
+	running = true
 	for _, entry := range tasks {
 		go runTask(entry)
 	}
-	tasksMu.RUnlock()
+	tasksMu.Unlock()
 
 	// 阻塞主协程
 	select {}

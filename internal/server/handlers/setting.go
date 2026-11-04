@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -10,10 +11,12 @@ import (
 
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/relay"
 	"github.com/bestruirui/octopus/internal/server/middleware"
 	"github.com/bestruirui/octopus/internal/server/resp"
 	"github.com/bestruirui/octopus/internal/server/router"
 	"github.com/bestruirui/octopus/internal/task"
+	"github.com/bestruirui/octopus/internal/utils/restart"
 	"github.com/gin-gonic/gin"
 )
 
@@ -36,6 +39,10 @@ func init() {
 		AddRoute(
 			router.NewRoute("/import", http.MethodPost).
 				Handle(importDB),
+		).
+		AddRoute(
+			router.NewRoute("/restart", http.MethodPost).
+				Handle(restartServer),
 		)
 }
 
@@ -70,8 +77,34 @@ func setSetting(c *gin.Context) {
 			return
 		}
 		task.Update(string(setting.Key), time.Duration(hours)*time.Hour)
+	case model.SettingKeyStatsSaveInterval:
+		// 定时任务在启动时按旧间隔建好 ticker, 改完要立刻换掉, 否则得重启才生效。
+		minutes, err := strconv.Atoi(setting.Value)
+		if err != nil || minutes <= 0 {
+			resp.Error(c, http.StatusBadRequest, "stats save interval must be a positive integer")
+			return
+		}
+		task.Set(task.TaskStatsSave, time.Duration(minutes)*time.Minute, op.StatsSaveDBTask)
 	}
 	resp.Success(c, setting)
+}
+
+// restartServer 重启进程, 让只影响启动流程的配置生效。
+// 有在途请求时先拒绝, 由前端确认后带 force=true 再来, 避免静默掐断正在流式输出的回复。
+func restartServer(c *gin.Context) {
+	force := c.Query("force") == "true" || c.Query("force") == "1"
+	if !force {
+		if active := relay.ActiveCount(); active > 0 {
+			resp.Error(c, http.StatusConflict, fmt.Sprintf("有 %d 个请求正在处理中, 重启会中断它们", active))
+			return
+		}
+	}
+	resp.Success(c, nil)
+	go func() {
+		// 留出时间把响应写回客户端, 否则调用方只会看到连接被重置。
+		time.Sleep(300 * time.Millisecond)
+		restart.Restart()
+	}()
 }
 
 func exportDB(c *gin.Context) {
