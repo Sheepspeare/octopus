@@ -157,3 +157,24 @@ type ChannelFetchModel struct {
 	Name      string   `json:"name"`      // 上游模型名称。
 	Protocols Protocol `json:"protocols"` // 由探测结果得出的协议位掩码。
 }
+
+// 对单个模型发起一次真实补全请求的测试; 与拉取模型列表不同, 这里要的是能出字, 而非能列出名字。
+// 同样收整份渠道配置: 测试须与保存后生效的地址, 路径, 代理与 Header 完全一致, 否则测通与实际转发仍是两回事。
+// 协议留空表示按 chat, responses, anthropic 的顺序逐个试到成功为止。
+type ChannelTestModelRequest struct {
+	Channel  ChannelConfig `json:"channel"`                  // 用于测试的渠道配置, 提供地址, 路径, 代理与 Header。
+	Key      string        `json:"key" binding:"required"`   // 测试使用的上游凭据。
+	Model    string        `json:"model" binding:"required"` // 待测试的上游模型名称。
+	Protocol Protocol      `json:"protocol"`                 // 指定测试的协议; 留空按默认顺序逐个尝试。
+}
+
+// 单次模型测试的结果; 上游拒绝也按正常结果返回, 由 OK 区分, 便于界面直接展示上游原文。
+type ChannelTestModelResult struct {
+	OK       bool     `json:"ok"`                // 是否取得可用的补全内容。
+	Protocol Protocol `json:"protocol"`          // 实际尝试且成功的协议; 全部失败时为最后尝试的协议。
+	Status   int      `json:"status"`            // 上游 HTTP 状态码; 网络层失败时为 0。
+	Latency  int64    `json:"latency_ms"`        // 本次测试从发出到读完响应的耗时, 单位毫秒。
+	Content  string   `json:"content,omitempty"` // 从响应中提取到的文本片段, 成功时非空。
+	Body     string   `json:"body,omitempty"`    // 上游响应原文的截断片段, 供失败时定位原因。
+	Error    string   `json:"error,omitempty"`   // 失败原因, 成功时为空。
+}

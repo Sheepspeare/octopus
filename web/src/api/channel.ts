@@ -126,6 +126,27 @@ export type FetchModel = {
     protocols: number; // Protocol 位掩码。
 };
 
+// TestModelRequest 对单个模型发起一次真实补全请求。
+// 与试拉模型列表同理，渠道尚未保存时也要能测，故随请求携带整份渠道配置。
+// protocol 留空表示按 chat、responses、anthropic 的顺序逐个试到成功为止。
+type TestModelRequest = {
+    channel: Omit<ChannelDetail, 'id' | 'keys' | 'models' | 'grants'>;
+    key: string;
+    model: string;
+    protocol?: number;
+};
+
+// TestModelResult 是一次模型测试的结果；上游拒绝也按正常结果返回，由 ok 区分，便于直接展示上游原文。
+export type TestModelResult = {
+    ok: boolean;
+    protocol: number; // 实际尝试且成功的协议；全部失败时为最后尝试的协议。
+    status: number; // 上游 HTTP 状态码；网络层失败时为 0。
+    latency_ms: number;
+    content?: string; // 提取到的输出文本，成功时非空。
+    body?: string; // 上游响应原文的截断片段，供失败时定位原因。
+    error?: string;
+};
+
 // channelGrantListQueryOptions 供分组页查询可选授权。
 // 与渠道列表分开: 选取成员只需名称与可用性, 拉整份渠道会连带路径, 代理与凭据明文。
 export const channelGrantListQueryOptions = queryOptions({
@@ -295,5 +316,30 @@ export function useFetchModel() {
     return useMutation({
         mutationFn: (data: FetchModelRequest) =>
             apiRequest<FetchModel[]>('/api/v1/channel/fetch-model', { method: 'POST', body: data }),
+    });
+}
+
+/**
+ * 测试单个模型能否真实出字 Hook
+ *
+ * 与试拉模型列表不同：拉列表只能证明地址与凭据可用，上游可能列出并未开通的模型，
+ * 该模型也可能在某个协议端点上并不响应。测试按真实转发的方式发一次最小补全请求。
+ *
+ * @example
+ * const testModel = useTestModel();
+ *
+ * testModel.mutate({
+ *   channel: { base_url: 'https://api.openai.com', openai_chat_completion_path: '/v1/chat/completions', ... },
+ *   key: 'sk-xxx',
+ *   model: 'gpt-4o',
+ * });
+ *
+ * // 在 onSuccess 中读取结果，ok 为 false 时 error 与 body 给出上游原因
+ * testModel.data // { ok: true, protocol: 2, status: 200, latency_ms: 812, content: 'Hello!' }
+ */
+export function useTestModel() {
+    return useMutation({
+        mutationFn: (data: TestModelRequest) =>
+            apiRequest<TestModelResult>('/api/v1/channel/test-model', { method: 'POST', body: data }),
     });
 }

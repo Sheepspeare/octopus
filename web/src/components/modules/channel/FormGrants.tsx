@@ -1,7 +1,21 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronsDownUp, ChevronsUpDown, Eraser, Plus, RefreshCw, Trash2, type LucideIcon } from 'lucide-react';
+import {
+    CheckCircle2,
+    ChevronRight,
+    ChevronsDownUp,
+    ChevronsUpDown,
+    Eraser,
+    Loader2,
+    PlugZap,
+    Plus,
+    RefreshCw,
+    Trash2,
+    XCircle,
+    type LucideIcon,
+} from 'lucide-react';
+import { toast } from 'sonner';
 import { useTranslations } from 'use-intl';
-import { Protocol } from '@/api/channel';
+import { Protocol, useTestModel, type TestModelResult } from '@/api/channel';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import {
@@ -13,7 +27,7 @@ import {
 } from '@/components/ui/select';
 import { IconButton } from '@/components/common/IconButton';
 import { useModelProbe } from './probe';
-import { grantKey, type ChannelFormState } from './state';
+import { grantKey, toChannelConfig, type ChannelFormState } from './state';
 
 // GrantCells 渲染一行右侧固定的四格: chat, response, message 三个协议勾选和一个删除。
 // 表头, 模型行, 凭据子行的差别只是这一行覆盖的 (模型 × 凭据) 范围与删除动作, 勾选,
@@ -92,13 +106,51 @@ export function FormGrants({ state, setState }: {
 }) {
     const t = useTranslations('channel.form');
     const { probe, pendingKey } = useModelProbe();
+    const testModel = useTestModel();
     const [expanded, setExpanded] = useState<Set<string>>(new Set()); // 已展开的模型名, 支持同时展开多个。
     const [adding, setAdding] = useState('');
     const [selectedKey, setSelectedKey] = useState('');
+    const [testing, setTesting] = useState<string | null>(null); // 正在测试的模型名, 同时用于禁用其余测试按钮。
+    const [results, setResults] = useState<Map<string, TestModelResult>>(new Map()); // 各模型最近一次测试结果。
 
     const keyNames = state.keys.map((k) => k.name);
     const activeKey = selectedKey || keyNames[0] || '';
     const allExpanded = state.models.length > 0 && state.models.every((m) => expanded.has(m));
+
+    // testOne 用该模型已授权的第一个凭据发一次真实补全请求; 尚无授权时退回当前选中的凭据,
+    // 以便在勾选协议之前先确认这条模型确实能出字。协议不指定, 由后端按 chat, responses,
+    // anthropic 的顺序试到成功为止: 单协议上游只有一侧讲得通, 逐个试比让用户猜更省事。
+    const testOne = async (modelName: string) => {
+        const grantedKey = keyNames.find(
+            (keyName) => (state.grants.get(grantKey(modelName, keyName)) ?? 0) !== 0
+        );
+        const channelKey = state.keys.find((k) => k.name === (grantedKey ?? activeKey));
+        if (!channelKey || channelKey.key.trim() === '') {
+            toast.error(t('testMissingKey'));
+            return;
+        }
+
+        setTesting(modelName);
+        try {
+            const result = await testModel.mutateAsync({
+                channel: toChannelConfig(state),
+                key: channelKey.key.trim(),
+                model: modelName,
+            });
+            setResults((prev) => new Map(prev).set(modelName, result));
+            if (result.ok) {
+                toast.success(t('testSuccess', { model: modelName, ms: result.latency_ms }));
+            } else {
+                toast.error(t('testFailed', { model: modelName }), {
+                    description: result.error ?? result.body ?? '',
+                });
+            }
+        } catch (error) {
+            toast.error(t('testFailed', { model: modelName }), { description: String(error) });
+        } finally {
+            setTesting(null);
+        }
+    };
 
     // removeGrant 移除该模型在指定凭据上的授权, 模型与凭据本身保留。
     const removeGrant = (modelName: string, keyName: string) => {
@@ -205,6 +257,17 @@ export function FormGrants({ state, setState }: {
                         const granted = keyNames.filter(
                             (keyName) => (state.grants.get(grantKey(modelName, keyName)) ?? 0) !== 0
                         ).length;
+                        const result = results.get(modelName);
+                        const isTesting = testing === modelName;
+                        // 图标即状态: 未测为插头, 测试中转圈, 成功打勾, 失败打叉, 颜色同步区分。
+                        const TestIcon = isTesting ? Loader2 : result?.ok ? CheckCircle2 : result ? XCircle : PlugZap;
+                        const testTip = isTesting
+                            ? t('testing')
+                            : result?.ok
+                              ? t('testOkTip', { ms: result.latency_ms })
+                              : result
+                                ? t('testFailTip')
+                                : t('modelTest');
                         return (
                             <div key={modelName} className="border-b border-border last:border-0">
                                 <div className="flex items-center gap-1 px-3 py-2">
@@ -223,6 +286,21 @@ export function FormGrants({ state, setState }: {
                                             {granted}/{keyNames.length}
                                         </span>
                                     </button>
+                                    {/* 测试按钮紧邻协议列左侧: 表头不带它, 右侧四列仍与模型行对齐。 */}
+                                    <IconButton
+                                        onClick={() => testOne(modelName)}
+                                        disabled={testing !== null || !state.base_url.trim()}
+                                        className={`size-7 ${
+                                            result?.ok
+                                                ? 'text-emerald-600 hover:text-emerald-600'
+                                                : result
+                                                  ? 'text-destructive hover:text-destructive'
+                                                  : ''
+                                        }`}
+                                        tip={testTip}
+                                    >
+                                        <TestIcon className={`size-3.5 ${isTesting ? 'animate-spin' : ''}`} />
+                                    </IconButton>
                                     <GrantCells
                                         state={state} setState={setState}
                                         models={[modelName]} keyNames={keyNames}

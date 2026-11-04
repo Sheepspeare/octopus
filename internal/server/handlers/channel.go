@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/op"
@@ -57,6 +59,10 @@ func init() {
 		AddRoute(
 			router.NewRoute("/fetch-model", http.MethodPost).
 				Handle(fetchModel),
+		).
+		AddRoute(
+			router.NewRoute("/test-model", http.MethodPost).
+				Handle(testModel),
 		)
 }
 
@@ -207,23 +213,14 @@ func fetchModel(c *gin.Context) {
 		return
 	}
 
-	var httpClient *http.Client
-	var err error
-	switch {
-	case !target.Proxy:
-		httpClient, err = rhttp.Direct()
-	case target.ChannelProxy == "":
-		httpClient, err = rhttp.Proxy()
-	default:
-		httpClient, err = rhttp.New(target.ChannelProxy)
-		// 渠道专用代理的客户端不再共享, 探测完就得关掉空闲连接; 探测收的是未落库的输入, 留着也无从复用。
-		if httpClient != nil {
-			defer httpClient.CloseIdleConnections()
-		}
-	}
+	httpClient, exclusive, err := probeClient(target)
 	if err != nil {
 		resp.Error(c, http.StatusBadGateway, err.Error())
 		return
+	}
+	// 渠道专用代理的客户端不再共享, 探测完就得关掉空闲连接; 探测收的是未落库的输入, 留着也无从复用。
+	if exclusive && httpClient != nil {
+		defer httpClient.CloseIdleConnections()
 	}
 
 	var openaiModels, anthropicModels []string
@@ -327,6 +324,300 @@ func fetchModel(c *gin.Context) {
 	resp.Success(c, models)
 }
 
+// 单模型测试的固定参数: 提示词取最短的可读文本, 输出上限压到最小, 测试只为确认能出字而不消耗额度。
+const (
+	testPrompt        = "hi"
+	testMaxTokens     = 16
+	anthropicVersion  = "2023-06-01"
+	modelTestTimeout  = 30 * time.Second
+	testBodyLimit     = 4096 // 上游响应体的读取上限, 足够覆盖正常补全与常见报错。
+	testBodyShowLimit = 1024 // 回给界面的响应原文长度上限, 超出部分截断。
+)
+
+// probeClient 按渠道配置构造探测用的 HTTP 客户端, 与保存后转发时用的形态保持一致。
+// 渠道专用代理的客户端不再共享, 故第二个返回值表示调用方是否需要在用完后关闭空闲连接。
+func probeClient(target model.ChannelConfig) (*http.Client, bool, error) {
+	if !target.Proxy {
+		client, err := rhttp.Direct()
+		return client, false, err
+	}
+	if target.ChannelProxy == "" {
+		client, err := rhttp.Proxy()
+		return client, false, err
+	}
+	client, err := rhttp.New(target.ChannelProxy)
+	return client, true, err
+}
+
+// testModel 对指定模型发起一次最小补全请求, 用于确认渠道配置真的能出字。
+// 拉取模型列表只能证明地址与凭据可用: 上游可能列出并未开通的模型, 该模型也可能在某个协议端点上并不响应。
+// 故此处按真实转发的方式构造请求, 把状态码, 耗时与上游原文一并回给界面。
+func testModel(c *gin.Context) {
+	var request model.ChannelTestModelRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		resp.Error(c, http.StatusBadRequest, resp.ErrInvalidJSON)
+		return
+	}
+	// 与拉取模型列表同理: 测试收的是尚未落库的配置, 不经 normalizeChannelConfig, 故在此自行去空白。
+	target := request.Channel
+	target.BaseURL = strings.TrimSpace(target.BaseURL)
+	target.ChannelProxy = strings.TrimSpace(target.ChannelProxy)
+	target.OpenAIChatCompletionPath = strings.TrimSpace(target.OpenAIChatCompletionPath)
+	target.OpenAIResponsePath = strings.TrimSpace(target.OpenAIResponsePath)
+	target.AnthropicMessagePath = strings.TrimSpace(target.AnthropicMessagePath)
+	if target.BaseURL == "" {
+		resp.Error(c, http.StatusBadRequest, "channel base url is required")
+		return
+	}
+	channelKey := strings.TrimSpace(request.Key)
+	if channelKey == "" {
+		resp.Error(c, http.StatusBadRequest, "channel key is required")
+		return
+	}
+	modelName := strings.TrimSpace(request.Model)
+	if modelName == "" {
+		resp.Error(c, http.StatusBadRequest, "model name is required")
+		return
+	}
+
+	httpClient, exclusive, err := probeClient(target)
+	if err != nil {
+		resp.Error(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	if exclusive && httpClient != nil {
+		defer httpClient.CloseIdleConnections()
+	}
+
+	// 测试自带超时: 上游不响应时不能让界面一直转圈, 也不必等到客户端断开才释放连接。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), modelTestTimeout)
+	defer cancel()
+
+	var last model.ChannelTestModelResult
+	for _, protocol := range modelTestProtocols(request.Protocol) {
+		result := runModelTest(ctx, httpClient, target, channelKey, modelName, protocol)
+		if result.OK {
+			resp.Success(c, result)
+			return
+		}
+		last = result
+		// 指定的协议只试一次; 未指定时按顺序试到成功为止, 但超时与取消已无重试意义。
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	// 上游拒绝属正常测试结果而非接口错误: 失败原因要原样带给界面, 故仍按 200 返回并由 OK 区分。
+	resp.Success(c, last)
+}
+
+// modelTestProtocols 给出本次测试要尝试的协议顺序; 指定协议时只试那一个。
+// 默认顺序与拉取模型列表一致: Chat Completions 最通用, 其次 Responses, 最后 Anthropic。
+func modelTestProtocols(requested model.Protocol) []model.Protocol {
+	if requested != 0 {
+		return []model.Protocol{requested}
+	}
+	return []model.Protocol{
+		model.ProtocolOpenAIChatCompletion,
+		model.ProtocolOpenAIResponse,
+		model.ProtocolAnthropicMessage,
+	}
+}
+
+// runModelTest 用指定协议发一次真实请求并解析结果; 网络层与上游层的失败都收进结果, 不向上抛。
+func runModelTest(ctx context.Context, httpClient *http.Client, target model.ChannelConfig, key, modelName string, protocol model.Protocol) model.ChannelTestModelResult {
+	result := model.ChannelTestModelResult{Protocol: protocol}
+	request, err := buildTestRequest(ctx, target, key, modelName, protocol)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	started := time.Now()
+	response, err := httpClient.Do(request)
+	result.Latency = time.Since(started).Milliseconds()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	defer response.Body.Close()
+
+	result.Status = response.StatusCode
+	body, err := io.ReadAll(io.LimitReader(response.Body, testBodyLimit))
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.Body = truncateText(string(body), testBodyShowLimit)
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		result.Error = fmt.Sprintf("upstream %s: %s", response.Status, truncateText(string(body), 512))
+		return result
+	}
+
+	content, err := testResponseContent(protocol, body)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.OK = true
+	result.Content = truncateText(content, 256)
+	return result
+}
+
+// buildTestRequest 按协议构造最小的真实请求; 地址, 路径与 Header 与转发路径共用同一份配置。
+func buildTestRequest(ctx context.Context, target model.ChannelConfig, key, modelName string, protocol model.Protocol) (*http.Request, error) {
+	var payload any
+	switch protocol {
+	case model.ProtocolOpenAIResponse:
+		payload = map[string]any{
+			"model":             modelName,
+			"input":             testPrompt,
+			"max_output_tokens": testMaxTokens,
+			"stream":            false,
+		}
+	case model.ProtocolAnthropicMessage:
+		payload = map[string]any{
+			"model":      modelName,
+			"max_tokens": testMaxTokens,
+			"messages":   []map[string]string{{"role": "user", "content": testPrompt}},
+		}
+	default:
+		payload = map[string]any{
+			"model":      modelName,
+			"messages":   []map[string]string{{"role": "user", "content": testPrompt}},
+			"max_tokens": testMaxTokens,
+			"stream":     false,
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	url := strings.TrimRight(target.BaseURL, "/") + "/" + strings.TrimLeft(testPath(target, protocol), "/")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	switch protocol {
+	case model.ProtocolAnthropicMessage:
+		request.Header.Set("X-Api-Key", key)
+		request.Header.Set("Anthropic-Version", anthropicVersion)
+	default:
+		request.Header.Set("Authorization", "Bearer "+key)
+	}
+	for _, header := range target.CustomHeader {
+		if header.HeaderKey != "" {
+			request.Header.Set(header.HeaderKey, header.HeaderValue)
+		}
+	}
+	return request, nil
+}
+
+// testPath 取指定协议的请求路径; 表单未填时用保存时会补上的默认值, 保证测试与实际转发打在同一处。
+func testPath(target model.ChannelConfig, protocol model.Protocol) string {
+	switch protocol {
+	case model.ProtocolOpenAIResponse:
+		if target.OpenAIResponsePath != "" {
+			return target.OpenAIResponsePath
+		}
+		return "/v1/responses"
+	case model.ProtocolAnthropicMessage:
+		if target.AnthropicMessagePath != "" {
+			return target.AnthropicMessagePath
+		}
+		return "/v1/messages"
+	default:
+		if target.OpenAIChatCompletionPath != "" {
+			return target.OpenAIChatCompletionPath
+		}
+		return "/v1/chat/completions"
+	}
+}
+
+// testResponseContent 从三种协议的响应里取出模型输出的文本; 取不到即视为测试失败。
+// 只回用量或空壳的响应同样说明该端点讲不通, 故不把 HTTP 200 本身当作成功。
+// 推理模型的思考内容也算输出: 测试的目的是确认模型确实在算, 而非考核回答质量。
+func testResponseContent(protocol model.Protocol, body []byte) (string, error) {
+	switch protocol {
+	case model.ProtocolOpenAIResponse:
+		var parsed struct {
+			OutputText string `json:"output_text"`
+			Output     []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return "", fmt.Errorf("decode response: %w", err)
+		}
+		if text := strings.TrimSpace(parsed.OutputText); text != "" {
+			return text, nil
+		}
+		var builder strings.Builder
+		for _, item := range parsed.Output {
+			for _, part := range item.Content {
+				builder.WriteString(part.Text)
+			}
+		}
+		if text := strings.TrimSpace(builder.String()); text != "" {
+			return text, nil
+		}
+		return "", fmt.Errorf("upstream returned no output text")
+	case model.ProtocolAnthropicMessage:
+		var parsed struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return "", fmt.Errorf("decode response: %w", err)
+		}
+		var builder strings.Builder
+		for _, part := range parsed.Content {
+			builder.WriteString(part.Text)
+			builder.WriteString(part.Thinking)
+		}
+		if text := strings.TrimSpace(builder.String()); text != "" {
+			return text, nil
+		}
+		return "", fmt.Errorf("upstream returned no output text")
+	default:
+		var parsed struct {
+			Choices []struct {
+				Message struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return "", fmt.Errorf("decode response: %w", err)
+		}
+		for _, choice := range parsed.Choices {
+			if text := strings.TrimSpace(choice.Message.Content); text != "" {
+				return text, nil
+			}
+			if text := strings.TrimSpace(choice.Message.ReasoningContent); text != "" {
+				return text, nil
+			}
+		}
+		return "", fmt.Errorf("upstream returned no output text")
+	}
+}
+
+// truncateText 按字符截断, 避免把多字节字符切成半个; 未超限时原样返回。
+func truncateText(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
+}
+
 // modelsURL 取协议请求路径的父级目录, 与地址拼成同级的 /models 地址。
 // 例如 /v1/chat/completions 与 /v1/messages 都得到 /v1/models, /chat/completions 得到 /models。
 func modelsURL(baseURL, protocolPath string) string {
@@ -380,7 +671,7 @@ func fetchAnthropicModels(httpClient *http.Client, ctx context.Context, target m
 			return nil, err
 		}
 		req.Header.Set("X-Api-Key", key)
-		req.Header.Set("Anthropic-Version", "2023-06-01")
+		req.Header.Set("Anthropic-Version", anthropicVersion)
 		for _, header := range target.CustomHeader {
 			if header.HeaderKey != "" {
 				req.Header.Set(header.HeaderKey, header.HeaderValue)
