@@ -390,7 +390,8 @@
     "log": {
         "list": {
             "empty": "暫無日誌",
-            "disconnected": "日誌連線已中斷，正在重新連線"
+            "disconnected": "日誌連線已中斷，正在重新連線",
+"loadOlder": "載入更早的記錄"
         },
         "status": {
             "committed": "回應中"

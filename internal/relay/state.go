@@ -62,8 +62,7 @@ type RequestState struct {
 }
 
 const streamBuffer = 16                              // 单个状态流连接的非阻塞消息缓冲容量。
-const maxFinished = 200                              // 进程内最多保留的已结束请求数量。
-const maxFinishedBytes = 128 << 20                   // 已结束记录保留的正文总量上限, 超出即淘汰最老的记录。
+const maxInMemory = 500                              // 进程内最多保留的已结束记录数量; 更早的历史在库里按需分页查。
 const maxBodyBytes = 8 << 20                         // 单条正文的保存上限, 超出即换成摘要。
 const outputPublishInterval = 500 * time.Millisecond // 输出字符数实时推送的最短发布间隔。
 
@@ -304,22 +303,55 @@ func (r *RequestState) finishLocked(usage *llm.Usage) {
 	}
 	publishRequestLocked(r)
 
+	// 正文交给写盘协程后立刻从内存里放开: 带图请求的正文可达数 MB, 留在内存里几百条就会把常驻占用吃光。
+	// 记录本身仍留在内存供状态流使用, 打开详情时正文按路径从文件读回。
+	requestBody := r.requestBody
+	responseBody := r.responseBody
+	r.requestBody = ""
+	r.responseBody = ""
+	enqueuePersist(recordOf(r), requestBody, responseBody)
+
+	// 内存只留最近若干条: 状态流建连时一次推全量快照, 太多既慢也没有意义, 更早的历史走分页查询。
 	finished := 0
-	totalBytes := 0
 	oldest := uint64(0)
 	for id, request := range requests {
 		if request.Status == StatusRunning || request.Status == StatusCommitted {
 			continue
 		}
 		finished++
-		totalBytes += len(request.requestBody) + len(request.responseBody)
 		if oldest == 0 || id < oldest {
 			oldest = id
 		}
 	}
-	// 条数与正文总量任一超限都淘汰最老的一条: 带图请求的正文可达数 MB, 只看条数挡不住内存增长。
-	if finished > maxFinished || totalBytes > maxFinishedBytes {
+	if finished > maxInMemory {
 		delete(requests, oldest)
+	}
+}
+
+// recordOf 把内存态转成待落库的记录; 正文体积大, 由调用方单独传给写盘协程, 不在此处拷贝。
+func recordOf(request *RequestState) model.RelayLog {
+	return model.RelayLog{
+		ID:                 request.ID,
+		Status:             string(request.Status),
+		StartedAt:          request.StartedAt,
+		Duration:           request.Duration,
+		FirstTokenDuration: request.FirstTokenDuration,
+		StreamDuration:     request.StreamDuration,
+		ResponseDuration:   request.ResponseDuration,
+		Model:              request.Model,
+		ReasoningEffort:    request.ReasoningEffort,
+		Protocol:           uint8(request.Protocol),
+		GroupID:            request.GroupID,
+		APIKeyName:         request.APIKeyName,
+		PromptTokens:       request.Usage.PromptTokens,
+		CompletionTokens:   request.Usage.CompletionTokens,
+		TotalTokens:        request.Usage.TotalTokens,
+		Cost:               request.Cost,
+		Round:              request.Round,
+		TargetChannelKey:   request.TargetChannelKey,
+		TargetModel:        request.TargetModel,
+		TargetProtocol:     uint8(request.TargetProtocol),
+		Error:              request.Error,
 	}
 }
 
@@ -384,36 +416,48 @@ func CloseRequestStream(stream chan RequestState) {
 	}
 }
 
-// RequestBody 返回指定请求保存的原始请求体, 记录不存在时返回空串。
+// RequestBody 返回指定请求的原始请求体; 内存里没有则按落盘路径读回。
+// 查询不能持锁进行: 读库与读文件都比内存慢, 持锁会连带阻塞状态流的推送。
 func RequestBody(id uint64) string {
 	mu.Lock()
-	defer mu.Unlock()
-
-	if request := requests[id]; request != nil {
-		return request.requestBody
+	request := requests[id]
+	body := ""
+	if request != nil {
+		body = request.requestBody
 	}
-	return ""
+	mu.Unlock()
+
+	if body != "" {
+		return body
+	}
+	return readPersistedBody(id, false)
 }
 
-// ResponseBody 返回指定请求当前保存的响应体, 记录不存在或响应未完成时返回空串。
+// ResponseBody 返回指定请求保存的响应体; 内存里没有则按落盘路径读回。
 func ResponseBody(id uint64) string {
 	mu.Lock()
-	defer mu.Unlock()
-
-	if request := requests[id]; request != nil {
-		return request.responseBody
+	request := requests[id]
+	body := ""
+	if request != nil {
+		body = request.responseBody
 	}
-	return ""
+	mu.Unlock()
+
+	if body != "" {
+		return body
+	}
+	return readPersistedBody(id, true)
 }
 
-// Clear 删除全部已结束的请求记录。
+// Clear 删除全部已结束的请求记录, 并清掉落盘的历史与正文文件。
 func Clear() {
 	mu.Lock()
-	defer mu.Unlock()
-
 	for id, request := range requests {
 		if request.Status != StatusRunning && request.Status != StatusCommitted {
 			delete(requests, id)
 		}
 	}
+	mu.Unlock()
+
+	ClearPersisted()
 }

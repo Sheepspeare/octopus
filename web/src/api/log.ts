@@ -107,6 +107,37 @@ export function useLogs() {
     return { logs, isLoading, error };
 }
 
+// useLogHistory 按需加载内存快照之外更早的记录, 供日志页向上翻页。
+// 实时记录仍由状态流推送, 这里只负责历史分页, 两段在页面侧按 ID 合并去重。
+export function useLogHistory() {
+    const [older, setOlder] = useState<RelayLogOverview[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [exhausted, setExhausted] = useState(false);
+
+    const load = async (beforeId: number) => {
+        setIsLoading(true);
+        try {
+            const page = await apiRequest<RelayLogOverview[]>(
+                `/api/v1/log/list?before_id=${beforeId}&limit=100`
+            );
+            if (page.length === 0) {
+                setExhausted(true);
+                return;
+            }
+            setOlder((current) => {
+                const seen = new Set(current.map((item) => item.id));
+                return [...current, ...page.filter((item) => !seen.has(item.id))];
+            });
+            // 返回不足一页说明已经到底, 再点也不会有新记录。
+            if (page.length < 100) setExhausted(true);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    return { older, load, isLoading, exhausted };
+}
+
 // useLogRequestBody 在调用方启用时按需获取指定日志的请求体。
 export function useLogRequestBody(id: number, startedAt: string, enabled: boolean) {
     return useQuery({

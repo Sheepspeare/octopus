@@ -30,6 +30,10 @@ func init() {
 				Handle(getResponseBody),
 		).
 		AddRoute(
+			router.NewRoute("/list", http.MethodGet).
+				Handle(listLogs),
+		).
+		AddRoute(
 			router.NewRoute("/stop/:id", http.MethodPost).
 				Handle(stopRequest),
 		).
@@ -63,11 +67,42 @@ func stopRequest(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// clearLog 删除全部已完成的请求记录，并在释放记录引用后主动执行垃圾回收。
+// clearLog 删除全部已完成的请求记录, 同时清掉落盘的历史与正文文件, 并在释放记录引用后主动执行垃圾回收。
 func clearLog(c *gin.Context) {
 	relay.Clear()
 	runtime.GC()
 	c.Status(http.StatusNoContent)
+}
+
+// listLogs 按 ID 倒序翻页读取已落库的历史, 供日志页加载内存快照之外更早的记录。
+// before_id 传当前列表里最小的 ID 即可续上一页; 不传则从最新一条开始。
+func listLogs(c *gin.Context) {
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if err != nil || limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var before uint64
+	if text := c.Query("before_id"); text != "" {
+		before, err = strconv.ParseUint(text, 10, 64)
+		if err != nil {
+			resp.Error(c, http.StatusBadRequest, "invalid before_id")
+			return
+		}
+	}
+
+	records, err := relay.ListPersisted(before, limit)
+	if err != nil {
+		resp.Error(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	states := make([]relay.RequestState, 0, len(records))
+	for _, record := range records {
+		states = append(states, relay.StateOf(record))
+	}
+	resp.Success(c, states)
 }
 
 // getRequestBody 返回指定请求的原始请求体。

@@ -390,7 +390,8 @@
     "log": {
         "list": {
             "empty": "No logs yet",
-            "disconnected": "Log stream disconnected, reconnecting"
+            "disconnected": "Log stream disconnected, reconnecting",
+"loadOlder": "Load older records"
         },
         "status": {
             "committed": "Responding"

@@ -4,6 +4,7 @@ import (
 	"github.com/bestruirui/octopus/internal/conf"
 	"github.com/bestruirui/octopus/internal/db"
 	"github.com/bestruirui/octopus/internal/op"
+	"github.com/bestruirui/octopus/internal/relay"
 	"github.com/bestruirui/octopus/internal/server"
 	"github.com/bestruirui/octopus/internal/task"
 	"github.com/bestruirui/octopus/internal/utils/shutdown"
@@ -30,6 +31,13 @@ var startCmd = &cobra.Command{
 			return
 		}
 		shutdown.Register(db.Close)
+
+		// 请求日志的正文落盘与历史恢复; 退出时先停写盘协程再关库, 故注册在 db.Close 之后。
+		relay.InitStore(conf.AppConfig.Relay.LogDir)
+		relay.StartPersistWorker()
+		relay.RestoreRecent()
+		relay.StartLogJanitor()
+		shutdown.Register(relay.StopStore)
 
 		if err := op.InitCache(); err != nil {
 			log.Errorf("cache init error: %v", err)

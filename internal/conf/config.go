@@ -23,10 +23,17 @@ type Database struct {
 	Path string `mapstructure:"path"`
 }
 
+// Relay 是请求日志的落盘配置。
+// 元数据进数据库, 请求与响应正文按日期写成文件, 只在打开详情时才读。
+type Relay struct {
+	LogDir string `mapstructure:"log_dir"`
+}
+
 type Config struct {
 	Server   Server   `mapstructure:"server"`
 	Log      Log      `mapstructure:"log"`
 	Database Database `mapstructure:"database"`
+	Relay    Relay    `mapstructure:"relay"`
 }
 
 var AppConfig Config
@@ -74,4 +81,5 @@ func setDefaults() {
 	viper.SetDefault("database.type", "sqlite")
 	viper.SetDefault("database.path", "data/data.db")
 	viper.SetDefault("log.level", "info")
+	viper.SetDefault("relay.log_dir", "data/logs")
 }
