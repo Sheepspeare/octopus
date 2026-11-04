@@ -104,7 +104,7 @@ type persistTask struct {
 // 批量落盘与内存缓存的参数。
 const (
 	persistBatchSize  = 50               // 攒够多少条就立即写盘。
-	persistBatchWait  = 2 * time.Second  // 不足一批时最长等这么久再写。
+	persistBatchWait  = 30 * time.Second // 不足一批时最长等这么久再写: 日志页看的是内存里的实时状态, 落盘延迟不影响观感, 等久些才能攒出真正的一批。
 	maxPendingBytes   = int64(100) << 20 // 待落盘正文的内存上限, 超过即强制写盘。
 	persistInsertSize = 100              // 单次事务插入的行数。
 )
