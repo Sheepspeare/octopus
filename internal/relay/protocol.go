@@ -103,11 +103,9 @@ func inspectStreamEvent(format llm.APIFormat, event *httpclient.StreamEvent) (bo
 			}
 			return true, &llm.ResponseError{Detail: llm.ErrorDetail{Message: "response failed", Type: "response_failed"}}
 		case responses.StreamEventTypeResponseIncomplete:
-			message := "response incomplete"
-			if parsed.Response != nil && parsed.Response.IncompleteDetails != nil && parsed.Response.IncompleteDetails.Reason != "" {
-				message += ": " + parsed.Response.IncompleteDetails.Reason
-			}
-			return true, &llm.ResponseError{Detail: llm.ErrorDetail{Message: message, Type: "response_incomplete"}}
+			// 输出被上限截断属于客户端设定 max_output_tokens 导致的正常终态, 按流结束处理,
+			// 已生成内容照常交付; 若判为失败会触发选路重试, 客户端反而收不到任何内容。
+			return true, nil
 		case responses.StreamEventTypeResponseCancelled:
 			return true, &llm.ResponseError{Detail: llm.ErrorDetail{Message: "response cancelled", Type: "response_cancelled"}}
 		case responses.StreamEventTypeError:
@@ -152,6 +150,8 @@ func inspectStreamEvent(format llm.APIFormat, event *httpclient.StreamEvent) (bo
 }
 
 // validateResponse 检查统一响应中需要在提交前判定为失败的终止原因; 仅 Responses 协议会以正常响应下发这类终态。
+// 输出被上限截断(length)不在此列: 它由客户端自己设定的 max_output_tokens 决定, 属于正常终态,
+// 若判为失败会进入选路重试, 客户端既拿不到内容又拿不到错误, 成员还会被反复按进冷却。
 func validateResponse(format llm.APIFormat, response *llm.Response) error {
 	if response == nil {
 		return errors.New("upstream response is empty")
@@ -162,8 +162,6 @@ func validateResponse(format llm.APIFormat, response *llm.Response) error {
 	switch *response.Choices[0].FinishReason {
 	case "error":
 		return &llm.ResponseError{Detail: llm.ErrorDetail{Message: "response failed", Type: "response_failed"}}
-	case "length":
-		return &llm.ResponseError{Detail: llm.ErrorDetail{Message: "response incomplete", Type: "response_incomplete"}}
 	case "cancelled":
 		return &llm.ResponseError{Detail: llm.ErrorDetail{Message: "response cancelled", Type: "response_cancelled"}}
 	default:

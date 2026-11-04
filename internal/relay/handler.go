@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -22,6 +23,11 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 	"github.com/tidwall/sjson"
 )
+
+// requestTotalBudget 限制单个请求在选路重试上的总耗时。
+// 上游长期不可用时, 每轮失败只刷新成员冷却而不返回错误, 没有这个上限连接会被一直占用,
+// 客户端只能看到长时间静默, 成员也在冷却与重试之间反复循环。
+const requestTotalBudget = 10 * time.Minute
 
 // Forward 按客户端协议承载一个请求的完整转发过程: 解析请求, 定位分组, 循环选目标请求上游, 直至提交响应或请求结束。
 func Forward(format llm.APIFormat) gin.HandlerFunc {
@@ -81,12 +87,23 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 		}
 		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, string(raw.Body), c.GetInt("api_key_id"))
 		ctx := request.requestCtx
-		failedItemID := 0 // 当前累计连续失败次数的成员 ID。
-		failures := 0     // 该成员包含首次请求的连续失败次数。
+		requestStartedAt := time.Now() // 总预算起点, 覆盖全部重试与退避等待。
+		failedItemID := 0              // 当前累计连续失败次数的成员 ID。
+		failures := 0                  // 该成员包含首次请求的连续失败次数。
 
 		for {
 			if ctx.Err() != nil {
 				request.markCanceled(ctx.Err(), "", nil)
+				return
+			}
+			// 总预算耗尽时按失败收尾并把最后一轮的错误返回客户端, 不再继续等待配置被修复。
+			// 未产生过上游错误(如分组没有可用成员)时用固定文案, 保证终态一定带原因。
+			if time.Since(requestStartedAt) >= requestTotalBudget {
+				if err == nil {
+					err = errors.New("no available upstream for this group")
+				}
+				request.markFailed(err, "", nil)
+				rejectRequestWithStatus(c, inbound, http.StatusGatewayTimeout, fmt.Errorf("upstream unavailable for over %s, last error: %w", requestTotalBudget, err))
 				return
 			}
 
@@ -364,9 +381,19 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 
 // rejectRequest 以客户端协议的错误格式返回请求级失败, 用于尚未登记状态因而无需定稿的请求。
 func rejectRequest(c *gin.Context, inbound transformer.Inbound, err error) {
+	writeErrorResponse(c, inbound, http.StatusBadRequest, "invalid_request_error", err)
+}
+
+// rejectRequestWithStatus 用指定状态码把上游侧错误按客户端协议写回, 用于网关自身判定的失败终态。
+func rejectRequestWithStatus(c *gin.Context, inbound transformer.Inbound, status int, err error) {
+	writeErrorResponse(c, inbound, status, "upstream_error", err)
+}
+
+// writeErrorResponse 把错误按客户端协议转换成对应形状的响应体并结束请求。
+func writeErrorResponse(c *gin.Context, inbound transformer.Inbound, status int, errorType string, err error) {
 	response := inbound.TransformError(c.Request.Context(), &llm.ResponseError{
-		StatusCode: http.StatusBadRequest,
-		Detail:     llm.ErrorDetail{Message: err.Error(), Type: "invalid_request_error"},
+		StatusCode: status,
+		Detail:     llm.ErrorDetail{Message: err.Error(), Type: errorType},
 	})
 	c.Data(response.StatusCode, "application/json", response.Body)
 	c.Abort()
