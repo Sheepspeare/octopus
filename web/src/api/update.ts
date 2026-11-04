@@ -1,35 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { apiRequest } from './client';
 
-/**
- * 后端 /api/v1/update 返回的最新发布信息
- */
-interface LatestInfo {
-    tag_name: string;
-    published_at: string;
-    body: string;
-    message: string;
-}
-
-/**
- * 获取最新发布信息 Hook
- * 
- * @example
- * const { data: latestInfo, isLoading, error } = useLatestInfo();
- * 
- * if (isLoading) return <Loading />;
- * if (error) return <Error message={error.message} />;
- * 
- * console.log('Latest tag:', latestInfo?.tag_name);
- */
-export function useLatestInfo() {
-    return useQuery({
-        queryKey: ['update', 'latest'],
-        queryFn: () => apiRequest<LatestInfo>('/api/v1/update'),
-        refetchInterval: 3600000, // 1 小时
-        refetchOnMount: 'always',
-    });
-}
+// 本构建已禁用在线更新: 官方二进制会覆盖掉全部定制改动, 后端 /api/v1/update 也直接拒绝更新请求。
+// 故这里只保留读取当前版本的接口, 不再提供查询最新发布与触发更新的封装。
 
 /**
  * 获取后端当前版本 Hook
@@ -42,29 +15,5 @@ export function useNowVersion() {
         queryFn: () => apiRequest<string>('/api/v1/update/now-version'),
         refetchInterval: 3600000, // 1 小时
         refetchOnMount: 'always',
-    });
-}
-
-/**
- * 执行更新 Hook
- * 
- * @example
- * const updateCore = useUpdateCore();
- * 
- * updateCore.mutate(undefined, {
- *   onSuccess: () => {
- *     console.log('Update started successfully');
- *   },
- * });
- */
-export function useUpdateCore() {
-    const queryClient = useQueryClient();
-
-    return useMutation({
-        mutationFn: () => apiRequest<string>('/api/v1/update', { method: 'POST' }),
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['update', 'latest'] });
-            queryClient.invalidateQueries({ queryKey: ['update', 'now-version'] });
-        },
     });
 }
