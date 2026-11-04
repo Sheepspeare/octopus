@@ -55,7 +55,7 @@ export function useRuntimeClock(source?: Group | Group[]) {
 export function MemberStatus({ group, itemId, now, active = false, activeClassName }: MemberStatusProps) {
     const t = useTranslations('group.card');
 
-    if (group.mode === 'failover' && itemId !== undefined) {
+    if (group.mode !== 'manual' && itemId !== undefined) {
         const cooldownUntil = group.runtime.cooldowns[itemId] ?? 0;
         const affinityUntil = group.runtime.current_item_id === itemId
             ? group.runtime.affinity_until

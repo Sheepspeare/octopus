@@ -80,6 +80,12 @@ func pickGroupItem(group model.Group) model.GroupItem {
 
 	route := groupRouteLocked(group)
 	now := time.Now().UnixMilli()
+
+	// 轮询模式不看亲和: 每轮都按成员顺序推进, 分摊是否均匀由轮转本身保证。
+	if group.Mode == model.GroupModeRoundRobin {
+		return pickRoundRobinLocked(group, route, now)
+	}
+
 	if route.AffinityUntil <= now {
 		route.AffinityUntil = 0
 	}
@@ -117,6 +123,35 @@ func pickGroupItem(group model.Group) model.GroupItem {
 	return model.GroupItem{}
 }
 
+// pickRoundRobinLocked 从当前成员的下一个开始轮转, 跳过冷却中的成员, 使请求按成员顺序均匀分摊。
+// 全部成员都在冷却时仍推进游标并照常返回, 避免健康成员尚未恢复时请求全部堆在同一个成员上。
+// 调用方必须持有 routeMu。
+func pickRoundRobinLocked(group model.Group, route *RouteState, now int64) model.GroupItem {
+	if len(group.Items) == 0 {
+		return model.GroupItem{}
+	}
+	start := 0
+	for index, item := range group.Items {
+		if item.ID == route.CurrentItemID {
+			start = index + 1
+			break
+		}
+	}
+	for offset := range group.Items {
+		item := group.Items[(start+offset)%len(group.Items)]
+		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
+			continue
+		}
+		route.CurrentItemID = item.ID
+		publishRouteLocked(route)
+		return item
+	}
+	item := group.Items[start%len(group.Items)]
+	route.CurrentItemID = item.ID
+	publishRouteLocked(route)
+	return item
+}
+
 // recordRouteSuccess 上报一轮成功: 结束该成员的冷却与探测占用, 并在故障切换后按配置开始亲和。
 func recordRouteSuccess(group model.Group, itemID int) {
 	if group.Mode == model.GroupModeManual {
@@ -143,8 +178,8 @@ func recordRouteSuccess(group model.Group, itemID int) {
 		}
 		changed = true
 	}
-	// 亲和只在故障切换后的首次成功时开始, 使请求在一段时间内稳定留在备用成员上。
-	if route.CurrentItemID == itemID && route.affinityArmed {
+	// 亲和只在故障切换后的首次成功时开始, 使请求在一段时间内稳定留在备用成员上; 轮询模式不做亲和。
+	if group.Mode == model.GroupModeFailover && route.CurrentItemID == itemID && route.affinityArmed {
 		route.affinityArmed = false
 		if group.RelayConfig.MemberAffinitySeconds > 0 {
 			route.AffinityUntil = now + int64(group.RelayConfig.MemberAffinitySeconds)*1000
@@ -181,7 +216,8 @@ func recordRouteFailure(group model.Group, itemID, failures int) bool {
 		route.ProbeItemID = 0
 	}
 	// 当前路由失败才需要下一个成员开始亲和; 独立探测失败不影响当前路由。
-	if route.CurrentItemID == itemID {
+	// 轮询模式保留游标: 清零会让下一轮重新从首个成员开始, 使分摊失衡。
+	if group.Mode == model.GroupModeFailover && route.CurrentItemID == itemID {
 		route.CurrentItemID = 0
 		route.AffinityUntil = 0
 		route.affinityArmed = true

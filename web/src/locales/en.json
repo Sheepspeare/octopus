@@ -329,9 +329,10 @@
         "form": {
             "name": "Group Name",
             "mode": "Routing Mode",
-            "modeHint": "Manual fixes one member; failover follows member order and switches on failures",
+            "modeHint": "Manual fixes one member; failover follows member order and switches on failures; round robin spreads requests evenly across members",
             "manual": "Manual",
             "failover": "Failover",
+            "roundRobin": "Round robin",
             "members": "Members",
             "relay": "Routing",
             "retryCount": "Maximum Attempts",

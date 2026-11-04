@@ -84,6 +84,15 @@ export const CHANNEL_PRESETS: ChannelPreset[] = [
         openai_chat_completion_path: '/api/coding/v3/chat/completions', openai_response_path: '/api/coding/v3/responses', anthropic_message_path: '/api/coding/v1/messages',
     },
     {
+        id: 'volcengine-plan', label: '火山方舟 Plan', Icon: VolcengineIcon,
+        description: {
+            zh_hans: '火山方舟套餐 API（/api/plan/v3）', zh_hant: '火山方舟套餐 API（/api/plan/v3）', en: 'Volcengine Ark Plan API (/api/plan/v3)',
+        },
+        dialect: 'generic',
+        base_url: 'https://ark.cn-beijing.volces.com',
+        openai_chat_completion_path: '/api/plan/v3/chat/completions', openai_response_path: '/api/plan/v3/responses', anthropic_message_path: '/api/plan/v3/messages',
+    },
+    {
         id: 'deepseek', label: 'DeepSeek', Icon: DeepSeekIcon,
         description: {
             zh_hans: 'DeepSeek 官方 API', zh_hant: 'DeepSeek 官方 API', en: 'Official DeepSeek API',

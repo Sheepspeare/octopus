@@ -428,6 +428,7 @@ export function GroupEditor({
                                 <SelectContent>
                                     <SelectItem value="manual">{t('form.manual')}</SelectItem>
                                     <SelectItem value="failover">{t('form.failover')}</SelectItem>
+                                    <SelectItem value="round_robin">{t('form.roundRobin')}</SelectItem>
                                 </SelectContent>
                             </Select>
                         </Field>
