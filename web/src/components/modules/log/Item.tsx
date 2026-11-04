@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useState, type CSSProperties } from 'react';
-import { AlertCircle, ArrowDownToLine, ArrowRight, ArrowUpFromLine, Brain, Clock, Cpu, Database, DollarSign, Gauge, KeyRound, Loader2, Square, Zap, Percent } from 'lucide-react';
+import { AlertCircle, ArrowDownToLine, ArrowRight, ArrowUpFromLine, Brain, Clock, Cpu, Database, DollarSign, Gauge, ImageIcon, KeyRound, Loader2, Square, X, Zap, Percent } from 'lucide-react';
 import { useTranslations } from 'use-intl';
 import JsonView from '@uiw/react-json-view';
 import { githubDarkTheme } from '@uiw/react-json-view/githubDark';
@@ -116,6 +116,90 @@ interface ObservedRound {
     startedAt: string; // 服务端记录的本轮开始时间。
 }
 
+// dataURLImage 只认内联图片的 data URL: 其余长字符串仍按文本交给 JsonView。
+const dataURLImage = /^data:image\/(png|jpe?g|gif|webp|bmp);base64,/i;
+
+// collectImages 递归收集正文里的内联图片, 供正文上方的附件条预览。
+// 深度与数量都设上限: 正文来自任意客户端, 不做限制会被畸形结构拖垮渲染。
+function collectImages(value: unknown, found: string[] = [], depth = 0): string[] {
+    if (found.length >= 8 || depth > 16) return found;
+    if (typeof value === 'string') {
+        if (dataURLImage.test(value)) found.push(value);
+        return found;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) collectImages(item, found, depth + 1);
+        return found;
+    }
+    if (value && typeof value === 'object') {
+        for (const item of Object.values(value)) collectImages(item, found, depth + 1);
+    }
+    return found;
+}
+
+// imageMeta 从 data URL 里读出格式与解码后的字节数; 仅供展示, 不校验内容是否真是图片。
+function imageMeta(src: string) {
+    const comma = src.indexOf(',');
+    const header = comma < 0 ? '' : src.slice(0, comma);
+    const payload = comma < 0 ? '' : src.slice(comma + 1);
+    const format = header.slice('data:image/'.length, header.indexOf(';')).toUpperCase();
+    const padding = payload.endsWith('==') ? 2 : payload.endsWith('=') ? 1 : 0;
+    const bytes = Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
+    return { format: format || 'IMG', bytes };
+}
+
+// formatBytes 把字节数压成便于阅读的两位以内的量级。
+function formatBytes(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// ImageAttachments 预览请求里携带的内联图片。
+// JsonView 对超长字符串只留前 30 个字符, 图片的 base64 在正文里等于不可读, 故单独给出看得见的入口。
+function ImageAttachments({ images }: { images: string[] }) {
+    const t = useTranslations('log.card');
+    const [preview, setPreview] = useState<string | null>(null);
+
+    return (
+        <div className="shrink-0 border-b border-border bg-muted/20 px-4 py-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <ImageIcon className="size-3.5" />
+                <span>{t('images', { count: images.length })}</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+                {images.map((src, index) => {
+                    const { format, bytes } = imageMeta(src);
+                    return (
+                        <button
+                            key={`${format}-${index}`}
+                            type="button"
+                            onClick={() => setPreview(src)}
+                            className="flex flex-col items-center gap-1 rounded-xl border border-border bg-background p-1.5 transition-colors hover:border-foreground/30"
+                        >
+                            <img src={src} alt="" className="size-20 rounded-lg object-cover" />
+                            <span className="text-[10px] text-muted-foreground">
+                                {format} · {formatBytes(bytes)}
+                            </span>
+                        </button>
+                    );
+                })}
+            </div>
+            {preview && (
+                <div
+                    className="fixed inset-0 z-100 flex cursor-zoom-out items-center justify-center bg-black/80 p-8"
+                    onClick={() => setPreview(null)}
+                >
+                    <img src={preview} alt="" className="max-h-full max-w-full rounded-lg object-contain" />
+                    <span className="absolute right-5 top-5 flex size-8 items-center justify-center rounded-full bg-black/50 text-white">
+                        <X className="size-4" />
+                    </span>
+                </div>
+            )}
+        </div>
+    );
+}
+
 // JsonContent 渲染请求或响应正文, 能解析为 JSON 时使用折叠视图, 否则按纯文本展示。
 function JsonContent({ content, fallbackText }: { content: string | object | undefined; fallbackText: string }) {
     const { resolvedTheme } = useTheme();
@@ -129,6 +213,12 @@ function JsonContent({ content, fallbackText }: { content: string | object | und
             return { isJson: false, data: content };
         }
     }, [content]);
+
+    // 图片只在解析成功的正文里找: 纯文本正文没有结构, 逐段匹配反而会把日志本身当图片。
+    const images = useMemo(
+        () => (parsed && parsed.isJson ? collectImages(parsed.data) : []),
+        [parsed]
+    );
 
     if (!parsed) {
         return (
@@ -147,19 +237,22 @@ function JsonContent({ content, fallbackText }: { content: string | object | und
     }
 
     return (
-        <div className="p-4 animate-in fade-in duration-200">
-            <JsonView
-                value={parsed.data as object}
-                style={{
-                    ...(resolvedTheme === 'dark' ? githubDarkTheme : githubLightTheme),
-                    fontSize: '12px',
-                    fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
-                    backgroundColor: 'transparent',
-                }}
-                displayDataTypes={false}
-                displayObjectSize={false}
-                collapsed={false}
-            />
+        <div className="animate-in fade-in duration-200">
+            {images.length > 0 && <ImageAttachments images={images} />}
+            <div className="p-4">
+                <JsonView
+                    value={parsed.data as object}
+                    style={{
+                        ...(resolvedTheme === 'dark' ? githubDarkTheme : githubLightTheme),
+                        fontSize: '12px',
+                        fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+                        backgroundColor: 'transparent',
+                    }}
+                    displayDataTypes={false}
+                    displayObjectSize={false}
+                    collapsed={false}
+                />
+            </div>
         </div>
     );
 }

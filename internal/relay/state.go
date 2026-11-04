@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,8 @@ type RequestState struct {
 
 const streamBuffer = 16                              // 单个状态流连接的非阻塞消息缓冲容量。
 const maxFinished = 200                              // 进程内最多保留的已结束请求数量。
+const maxFinishedBytes = 128 << 20                   // 已结束记录保留的正文总量上限, 超出即淘汰最老的记录。
+const maxBodyBytes = 8 << 20                         // 单条正文的保存上限, 超出即换成摘要。
 const outputPublishInterval = 500 * time.Millisecond // 输出字符数实时推送的最短发布间隔。
 
 var (
@@ -70,6 +73,24 @@ var (
 	requests = make(map[uint64]*RequestState)       // 按请求 ID 保存的全部请求状态。
 	watchers = make(map[chan RequestState]struct{}) // 全部状态流 SSE 连接。
 )
+
+// capBody 把超过上限的正文换成带说明的摘要。
+// 日志是进程内常驻数据, 单条几 MB 的图片请求乘上保留条数足以吃光内存, 故在此设一条硬上限;
+// 摘要仍是合法 JSON, 界面照常按 JSON 视图展示, 只是正文本身不再留存。
+func capBody(body string) string {
+	if len(body) <= maxBodyBytes {
+		return body
+	}
+	summary, err := json.Marshal(map[string]any{
+		"truncated": true,
+		"reason":    "正文超过单条保存上限, 已从内存日志中省略",
+		"bytes":     len(body),
+	})
+	if err != nil {
+		return ""
+	}
+	return string(summary)
+}
 
 // newRequestState 分配请求 ID 并登记初始运行状态; 返回的记录是本请求后续全部状态写入的入口。
 func newRequestState(ctx context.Context, modelName, reasoningEffort string, groupID int, protocol model.Protocol, body string, apiKeyID int) *RequestState {
@@ -85,7 +106,7 @@ func newRequestState(ctx context.Context, modelName, reasoningEffort string, gro
 		ReasoningEffort: reasoningEffort,
 		Protocol:        protocol,
 		GroupID:         groupID,
-		requestBody:     body,
+		requestBody:     capBody(body),
 		apiKeyID:        apiKeyID,
 		requestCtx:      requestCtx,
 		requestCancel:   requestCancel,
@@ -220,7 +241,7 @@ func (r *RequestState) markSucceeded(responseBody string, usage *llm.Usage) {
 
 	r.Status = StatusSuccess
 	r.Error = ""
-	r.responseBody = responseBody
+	r.responseBody = capBody(responseBody)
 	r.finishLocked(usage)
 }
 
@@ -237,7 +258,7 @@ func (r *RequestState) markFailed(err error, responseBody string, usage *llm.Usa
 		r.Error = err.Error()
 	}
 	if responseBody != "" {
-		r.responseBody = responseBody
+		r.responseBody = capBody(responseBody)
 	}
 	r.finishLocked(usage)
 }
@@ -284,17 +305,20 @@ func (r *RequestState) finishLocked(usage *llm.Usage) {
 	publishRequestLocked(r)
 
 	finished := 0
+	totalBytes := 0
 	oldest := uint64(0)
 	for id, request := range requests {
 		if request.Status == StatusRunning || request.Status == StatusCommitted {
 			continue
 		}
 		finished++
+		totalBytes += len(request.requestBody) + len(request.responseBody)
 		if oldest == 0 || id < oldest {
 			oldest = id
 		}
 	}
-	if finished > maxFinished {
+	// 条数与正文总量任一超限都淘汰最老的一条: 带图请求的正文可达数 MB, 只看条数挡不住内存增长。
+	if finished > maxFinished || totalBytes > maxFinishedBytes {
 		delete(requests, oldest)
 	}
 }

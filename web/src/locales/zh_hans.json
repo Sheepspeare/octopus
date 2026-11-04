@@ -407,6 +407,7 @@
             "channelCleared": "已取消渠道选择",
             "channelChangeFailed": "渠道切换失败",
             "responseContent": "响应内容",
+            "images": "图片附件 {count} 张",
             "noRequestContent": "(无请求内容)",
             "noResponseContent": "(无响应内容)",
             "tokens": "词元",

@@ -407,6 +407,7 @@
             "channelCleared": "已取消供應源選擇",
             "channelChangeFailed": "供應源切換失敗",
             "responseContent": "回應內容",
+            "images": "圖片附件 {count} 張",
             "noRequestContent": "(無請求內容)",
             "noResponseContent": "(無回應內容)",
             "tokens": "詞元",

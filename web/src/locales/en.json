@@ -407,6 +407,7 @@
             "channelCleared": "Channel selection cleared",
             "channelChangeFailed": "Failed to switch channel",
             "responseContent": "Response Content",
+            "images": "Image attachments: {count}",
             "noRequestContent": "(No request content)",
             "noResponseContent": "(No response content)",
             "tokens": "tokens",
