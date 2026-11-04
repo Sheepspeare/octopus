@@ -215,6 +215,15 @@
                 "save": "儲存",
                 "confirm": "確認"
             },
+            "test": {
+                "title": "外部呼叫測試",
+                "refresh": "重新拉取模型",
+                "baseUrl": "呼叫位址",
+                "modelsLoading": "正在拉取模型…",
+                "fetchFailed": "拉取模型失敗",
+                "ok": "呼叫成功 · {ms} ms",
+                "fail": "呼叫失敗 · HTTP {status}"
+            },
             "stats": {
                 "noData": "暫無統計數據",
                 "inputToken": "輸入詞元",

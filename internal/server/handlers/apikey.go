@@ -34,6 +34,14 @@ func init() {
 		AddRoute(
 			router.NewRoute("/delete/:id", http.MethodDelete).
 				Handle(deleteAPIKey),
+		).
+		AddRoute(
+			router.NewRoute("/test-models", http.MethodPost).
+				Handle(testAPIKeyModels),
+		).
+		AddRoute(
+			router.NewRoute("/test-chat", http.MethodPost).
+				Handle(testAPIKeyChat),
 		)
 	router.NewGroupRouter("/api/v1/apikey").
 		Use(middleware.APIKeyAuth()).

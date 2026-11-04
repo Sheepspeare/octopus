@@ -215,6 +215,15 @@
                 "save": "Save",
                 "confirm": "Confirm"
             },
+            "test": {
+                "title": "Live call test",
+                "refresh": "Reload models",
+                "baseUrl": "Endpoint",
+                "modelsLoading": "Loading models…",
+                "fetchFailed": "Failed to load models",
+                "ok": "Call succeeded · {ms} ms",
+                "fail": "Call failed · HTTP {status}"
+            },
             "stats": {
                 "noData": "No statistics available",
                 "inputToken": "Input Token",

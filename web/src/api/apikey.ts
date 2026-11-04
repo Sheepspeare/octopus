@@ -165,3 +165,50 @@ export function useDeleteAPIKey() {
         onSuccess: () => queryClient.invalidateQueries({ queryKey: apiKeyListQueryOptions.queryKey }),
     });
 }
+
+/**
+ * 外部调用测试的结果
+ *
+ * 后端用这把 Key 从本机回环请求自己的 /v1 入口，与外部客户端走同一条链路，
+ * 因此能验证钥匙是否可用、能用哪些模型、以及真实调用能否出字。
+ */
+export interface APIKeyTestResult {
+    ok: boolean;
+    status: number;
+    latency_ms: number;
+    base_url?: string;
+    models?: string[];
+    content?: string;
+    body?: string;
+    error?: string;
+}
+
+/**
+ * 用指定 API Key 拉取可用模型 Hook
+ *
+ * @example
+ * const testModels = useTestAPIKeyModels();
+ * testModels.mutate(1);
+ */
+export function useTestAPIKeyModels() {
+    return useMutation({
+        mutationFn: (id: number) =>
+            apiRequest<APIKeyTestResult>('/api/v1/apikey/test-models', { method: 'POST', body: { id } }),
+    });
+}
+
+/**
+ * 用指定 API Key 发起一次真实补全 Hook
+ *
+ * 请求会真实进入转发链路并计入统计与日志，这正是外部调用测试要暴露的东西。
+ *
+ * @example
+ * const testChat = useTestAPIKeyChat();
+ * testChat.mutate({ id: 1, model: 'doubao-seed-2.1-lite' });
+ */
+export function useTestAPIKeyChat() {
+    return useMutation({
+        mutationFn: (data: { id: number; model: string }) =>
+            apiRequest<APIKeyTestResult>('/api/v1/apikey/test-chat', { method: 'POST', body: data }),
+    });
+}

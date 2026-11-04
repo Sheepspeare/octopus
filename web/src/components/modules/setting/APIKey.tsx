@@ -1,6 +1,21 @@
 import { useId, useState } from 'react';
 import { useTranslations } from 'use-intl';
-import { KeyRound, Plus, Loader, Trash2, Check, X, Info, CalendarDays, Pencil, Maximize2 } from 'lucide-react';
+import {
+    KeyRound,
+    Plus,
+    Loader,
+    Trash2,
+    Check,
+    X,
+    Info,
+    CalendarDays,
+    Pencil,
+    Maximize2,
+    PlugZap,
+    CheckCircle2,
+    XCircle,
+    RefreshCw,
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Input } from '@/components/ui/input';
 import { Calendar } from '@/components/ui/calendar';
@@ -19,7 +34,10 @@ import {
     useCreateAPIKey,
     useUpdateAPIKey,
     useDeleteAPIKey,
+    useTestAPIKeyModels,
+    useTestAPIKeyChat,
     type APIKey,
+    type APIKeyTestResult,
 } from '@/api/apikey';
 import { useGroupList } from '@/api/group';
 import { useStatsAPIKey } from '@/api/stats';
@@ -462,6 +480,152 @@ function APIKeyStatsCard({
     );
 }
 
+// APIKeyTestPopover 外部调用测试: 用这把钥匙打本机 /v1 入口, 先列出可用模型, 再按模型发真实补全。
+// 模型清单来自 /v1/models 而非本地分组缓存, 因为这里要验证的正是「外部客户端能看见什么」。
+function APIKeyTestPopover({ apiKey }: { apiKey: APIKey }) {
+    const t = useTranslations('setting');
+    const testModels = useTestAPIKeyModels();
+    const testChat = useTestAPIKeyChat();
+
+    const [open, setOpen] = useState(false);
+    const [list, setList] = useState<APIKeyTestResult | null>(null);
+    const [results, setResults] = useState<Record<string, APIKeyTestResult>>({});
+    const [testing, setTesting] = useState<string | null>(null);
+    const [lastModel, setLastModel] = useState<string | null>(null);
+
+    const loadModels = () => {
+        setList(null);
+        testModels.mutate(apiKey.id, { onSuccess: (data) => setList(data) });
+    };
+
+    const handleOpenChange = (next: boolean) => {
+        setOpen(next);
+        if (next) loadModels();
+    };
+
+    const runChat = (model: string) => {
+        setTesting(model);
+        setLastModel(model);
+        testChat.mutate({ id: apiKey.id, model }, {
+            onSuccess: (data) => setResults((prev) => ({ ...prev, [model]: data })),
+            onSettled: () => setTesting(null),
+        });
+    };
+
+    const detail = lastModel ? results[lastModel] : undefined;
+
+    return (
+        <Popover open={open} onOpenChange={handleOpenChange}>
+            <PopoverTrigger asChild>
+                <button
+                    type="button"
+                    aria-label={t('apiKey.test.title')}
+                    className="flex size-8 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95"
+                >
+                    <PlugZap className="size-4" />
+                </button>
+            </PopoverTrigger>
+            <PopoverContent
+                align="end"
+                sideOffset={8}
+                className="w-80 rounded-2xl border border-border/60 bg-card p-3 shadow-xl"
+            >
+                <div className="mb-2 flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-card-foreground">{t('apiKey.test.title')}</span>
+                    <button
+                        type="button"
+                        onClick={loadModels}
+                        disabled={testModels.isPending}
+                        aria-label={t('apiKey.test.refresh')}
+                        className="flex size-6 items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:text-foreground disabled:opacity-50"
+                    >
+                        <RefreshCw className={cn('size-3.5', testModels.isPending && 'animate-spin')} />
+                    </button>
+                </div>
+
+                {list?.base_url && (
+                    <div className="mb-2 rounded-lg bg-muted/50 px-2 py-1">
+                        <div className="text-[10px] text-muted-foreground">{t('apiKey.test.baseUrl')}</div>
+                        <code className="block truncate text-[11px] text-card-foreground">{list.base_url}</code>
+                    </div>
+                )}
+
+                {testModels.isPending || !list ? (
+                    <div className="flex items-center justify-center gap-2 py-5 text-xs text-muted-foreground">
+                        <Loader className="size-3.5 animate-spin" />
+                        {t('apiKey.test.modelsLoading')}
+                    </div>
+                ) : !list.ok ? (
+                    <div className="space-y-1">
+                        <div className="flex items-center gap-1.5 text-xs text-destructive">
+                            <XCircle className="size-3.5" />
+                            {t('apiKey.test.fetchFailed')}
+                            {list.status > 0 && <span className="tabular-nums">· HTTP {list.status}</span>}
+                        </div>
+                        <p className="max-h-28 overflow-auto break-all rounded-lg bg-destructive/5 p-2 text-[11px] text-muted-foreground">
+                            {list.error || list.body}
+                        </p>
+                    </div>
+                ) : (
+                    <div className="max-h-56 space-y-0.5 overflow-y-auto">
+                        {list.models?.map((model) => {
+                            const result = results[model];
+                            const isTesting = testing === model;
+                            return (
+                                <button
+                                    key={model}
+                                    type="button"
+                                    onClick={() => runChat(model)}
+                                    disabled={testing !== null}
+                                    className="flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-muted/60 disabled:opacity-60"
+                                >
+                                    <span className="truncate text-xs text-card-foreground">{model}</span>
+                                    <span className="flex shrink-0 items-center gap-1 text-[11px] tabular-nums">
+                                        {isTesting ? (
+                                            <Loader className="size-3.5 animate-spin text-muted-foreground" />
+                                        ) : result?.ok ? (
+                                            <>
+                                                <CheckCircle2 className="size-3.5 text-emerald-600" />
+                                                <span className="text-emerald-600">{result.latency_ms}ms</span>
+                                            </>
+                                        ) : result ? (
+                                            <>
+                                                <XCircle className="size-3.5 text-destructive" />
+                                                <span className="text-destructive">{result.status || 'ERR'}</span>
+                                            </>
+                                        ) : (
+                                            <PlugZap className="size-3.5 text-muted-foreground/50" />
+                                        )}
+                                    </span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                )}
+
+                {detail && (
+                    <div className="mt-2 rounded-lg border border-border/60 p-2">
+                        <div
+                            className={cn(
+                                'mb-1 flex items-center gap-1 text-[11px] font-medium',
+                                detail.ok ? 'text-emerald-600' : 'text-destructive'
+                            )}
+                        >
+                            {detail.ok ? <CheckCircle2 className="size-3.5" /> : <XCircle className="size-3.5" />}
+                            {detail.ok
+                                ? t('apiKey.test.ok', { ms: detail.latency_ms })
+                                : t('apiKey.test.fail', { status: detail.status })}
+                        </div>
+                        <p className="max-h-24 overflow-auto break-all text-[11px] leading-4 text-muted-foreground">
+                            {detail.ok ? detail.content : detail.error || detail.body}
+                        </p>
+                    </div>
+                )}
+            </PopoverContent>
+        </Popover>
+    );
+}
+
 function APIKeyKeyItem({
     apiKey,
     statsLayoutId,
@@ -494,6 +658,7 @@ function APIKeyKeyItem({
             <span className="text-sm font-medium truncate">{apiKey.name}</span>
 
             <div className="flex items-center gap-1.5">
+                <APIKeyTestPopover apiKey={apiKey} />
                 <motion.button
                     type="button"
                     layoutId={statsLayoutId}

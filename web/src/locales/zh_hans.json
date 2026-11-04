@@ -215,6 +215,15 @@
                 "save": "保存",
                 "confirm": "确认"
             },
+            "test": {
+                "title": "外部调用测试",
+                "refresh": "重新拉取模型",
+                "baseUrl": "调用地址",
+                "modelsLoading": "正在拉取模型…",
+                "fetchFailed": "拉取模型失败",
+                "ok": "调用成功 · {ms} ms",
+                "fail": "调用失败 · HTTP {status}"
+            },
             "stats": {
                 "noData": "暂无统计数据",
                 "inputToken": "输入词元",
