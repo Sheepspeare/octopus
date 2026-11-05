@@ -21,6 +21,11 @@ type RouteState struct {
 	Cooldowns     map[int]int64 `json:"cooldowns"`       // 失败成员 ID 对应的冷却截止 Unix 毫秒时间, 已到期的条目由前端按当前时间忽略。
 
 	affinityArmed bool // 当前路由下一次成功后是否开始亲和, 仅故障切换后为真。
+	// provisional 标记 Cooldowns 中由确定性 4xx 临时压下的条目。
+	// 这类失败可能是请求本身有问题, 不能立刻算作成员故障; 但同批并发请求都在看着同一份冷却表,
+	// 若不立刻压下, 一个坏成员会在几秒内被每个并发请求各撞一次。故先压一个短冷却,
+	// 等本次请求在别的成员上成功再升级为正式冷却, 若整个请求都被同类 4xx 拒绝则整条撤销。
+	provisional map[int]bool
 }
 
 const routeStreamBuffer = 16 // 单个路由流连接的非阻塞消息缓冲容量。
@@ -63,9 +68,11 @@ func ResetRouteState(groupID int) {
 	delete(routes, groupID)
 }
 
-// pickGroupItem 按分组模式选择本轮目标成员, 没有可用成员时返回零值; group.Items 已按 Priority 升序排列。
-// 渠道是否可用不在此判断: 渠道禁用或缺少密钥由调用方发现并作为一轮失败上报, 该成员随即进入冷却而在后续轮次被跳过。
-func pickGroupItem(group model.Group) model.GroupItem {
+// pickGroupItem 按分组模式选择本轮目标成员, 没有可选成员时返回零值; group.Items 已按 Priority 升序排列。
+// 渠道是否可用不在此判断: GroupGetByName 已把渠道或凭据被禁用的成员滤掉, 这里只看路由状态。
+// exclude 是本请求内已经确认不值得再试的成员(例如上游对同一请求返回确定性的 4xx),
+// 排除只作用于当前请求: 请求结束即失效, 是否真正冷却由调用方在确认成员侧故障后决定。
+func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 	if group.Mode == model.GroupModeManual {
 		for _, item := range group.Items {
 			if item.ID == group.ActiveItemID {
@@ -83,19 +90,23 @@ func pickGroupItem(group model.Group) model.GroupItem {
 
 	// 轮询模式不看亲和: 每轮都按成员顺序推进, 分摊是否均匀由轮转本身保证。
 	if group.Mode == model.GroupModeRoundRobin {
-		return pickRoundRobinLocked(group, route, now)
+		return pickRoundRobinLocked(group, route, now, exclude)
 	}
 
 	if route.AffinityUntil <= now {
 		route.AffinityUntil = 0
 	}
 
-	// 亲和期内沿用当前成员, 不提前探测已恢复的高优先级成员。
-	if route.CurrentItemID != 0 && route.AffinityUntil > now {
+	// 亲和期内沿用当前成员, 不提前探测已恢复的高优先级成员; 当前成员被排除时立即放弃亲和。
+	if route.CurrentItemID != 0 && route.AffinityUntil > now && !exclude[route.CurrentItemID] {
 		return itemOf(group, route.CurrentItemID)
 	}
 
 	for _, item := range group.Items {
+		// 被排除的成员等同不可选: 当前成员若在其中, 不能在这里 break, 否则会把一个已知失败的成员继续交回去。
+		if exclude[item.ID] {
+			continue
+		}
 		// 遍历到当前成员说明比它优先级更高的成员都不可选, 沿用当前成员。
 		if item.ID == route.CurrentItemID {
 			break
@@ -117,16 +128,17 @@ func pickGroupItem(group model.Group) model.GroupItem {
 		publishRouteLocked(route)
 		return item
 	}
-	if route.CurrentItemID != 0 {
+	if route.CurrentItemID != 0 && !exclude[route.CurrentItemID] {
 		return itemOf(group, route.CurrentItemID)
 	}
 	return model.GroupItem{}
 }
 
-// pickRoundRobinLocked 从当前成员的下一个开始轮转, 跳过冷却中的成员, 使请求按成员顺序均匀分摊。
-// 全部成员都在冷却时仍推进游标并照常返回, 避免健康成员尚未恢复时请求全部堆在同一个成员上。
+// pickRoundRobinLocked 从当前成员的下一个开始轮转, 跳过冷却中与本请求已排除的成员, 使请求按成员顺序均匀分摊。
+// 全部成员都不可选时返回零值: 交给调用方按重试间隔等待, 比对着已知失败的成员空转更省资源,
+// 冷却到期后成员会自动回到轮转序列。
 // 调用方必须持有 routeMu。
-func pickRoundRobinLocked(group model.Group, route *RouteState, now int64) model.GroupItem {
+func pickRoundRobinLocked(group model.Group, route *RouteState, now int64, exclude map[int]bool) model.GroupItem {
 	if len(group.Items) == 0 {
 		return model.GroupItem{}
 	}
@@ -139,6 +151,9 @@ func pickRoundRobinLocked(group model.Group, route *RouteState, now int64) model
 	}
 	for offset := range group.Items {
 		item := group.Items[(start+offset)%len(group.Items)]
+		if exclude[item.ID] {
+			continue
+		}
 		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
 			continue
 		}
@@ -146,10 +161,71 @@ func pickRoundRobinLocked(group model.Group, route *RouteState, now int64) model
 		publishRouteLocked(route)
 		return item
 	}
-	item := group.Items[start%len(group.Items)]
-	route.CurrentItemID = item.ID
+	return model.GroupItem{}
+}
+
+// allItemsExcluded 判断分组内每个成员是否都已在本次请求中被排除。
+// 用于识别"问题在请求本身": 全部成员都对同一请求给出确定性拒绝时, 再换成员也不会有不同结果。
+func allItemsExcluded(group model.Group, exclude map[int]bool) bool {
+	if len(group.Items) == 0 {
+		return false
+	}
+	for _, item := range group.Items {
+		if !exclude[item.ID] {
+			return false
+		}
+	}
+	return true
+}
+
+// provisionalCooldown 是确定性 4xx 的临时冷却时长。
+// 它只需要覆盖"同一批并发请求都在飞"的窗口: 请求成功换成员后立刻升级为正式冷却,
+// 请求本身有问题时会在所有成员都试过后整条撤销, 因此这个值只是兜底上限。
+const provisionalCooldown = 15 * time.Second
+
+// markRouteSuspect 给返回确定性 4xx 的成员压一个临时冷却, 让同批并发请求立刻绕开它。
+func markRouteSuspect(group model.Group, itemID int) {
+	if group.Mode == model.GroupModeManual {
+		return
+	}
+
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	route := groupRouteLocked(group)
+	route.Cooldowns[itemID] = time.Now().Add(provisionalCooldown).UnixMilli()
+	if route.provisional == nil {
+		route.provisional = make(map[int]bool)
+	}
+	route.provisional[itemID] = true
 	publishRouteLocked(route)
-	return item
+}
+
+// clearRouteSuspects 撤销临时冷却: 分组内每个成员都对同一请求给出了确定性拒绝, 说明问题在请求本身,
+// 不该把成员留在冷却里。正式冷却不受影响。
+func clearRouteSuspects(group model.Group, itemIDs map[int]bool) {
+	if group.Mode == model.GroupModeManual || len(itemIDs) == 0 {
+		return
+	}
+
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	route := routes[group.ID]
+	if route == nil {
+		return
+	}
+	changed := false
+	for itemID := range itemIDs {
+		if route.provisional[itemID] {
+			delete(route.provisional, itemID)
+			delete(route.Cooldowns, itemID)
+			changed = true
+		}
+	}
+	if changed {
+		publishRouteLocked(route)
+	}
 }
 
 // recordRouteSuccess 上报一轮成功: 结束该成员的冷却与探测占用, 并在故障切换后按配置开始亲和。
@@ -192,8 +268,10 @@ func recordRouteSuccess(group model.Group, itemID int) {
 }
 
 // recordRouteFailure 上报一轮失败: 达到配置的总尝试次数后将该成员打入冷却并让出当前路由, 返回是否已冷却。
-// failures 为该成员在本请求内包含首次请求的连续失败次数, 由调用方累计。
-func recordRouteFailure(group model.Group, itemID, failures int) bool {
+// failures 为该成员在本请求内的累计失败次数, 由调用方按成员分别累计; 轮询模式下成员会交替,
+// 按成员累计才能让"同一成员反复失败"真正触发冷却。
+// cooldown 非零时用它代替分组配置的冷却时长, 用于上游明确给出的重试间隔(429 的 Retry-After)。
+func recordRouteFailure(group model.Group, itemID, failures int, cooldown time.Duration) bool {
 	if group.Mode == model.GroupModeManual {
 		return false
 	}
@@ -209,9 +287,14 @@ func recordRouteFailure(group model.Group, itemID, failures int) bool {
 	if route.ProbeItemID != itemID && failures < group.RelayConfig.MemberMaxAttempts {
 		return false
 	}
+	if cooldown <= 0 {
+		cooldown = time.Duration(group.RelayConfig.MemberCooldownSeconds) * time.Second
+	}
 
 	now := time.Now().UnixMilli()
-	route.Cooldowns[itemID] = now + int64(group.RelayConfig.MemberCooldownSeconds)*1000
+	route.Cooldowns[itemID] = now + cooldown.Milliseconds()
+	// 正式冷却接管临时冷却, 之后只有冷却到期才会重新放行探测。
+	delete(route.provisional, itemID)
 	if route.ProbeItemID == itemID {
 		route.ProbeItemID = 0
 	}
@@ -241,7 +324,7 @@ func releaseRouteProbe(group model.Group, itemID int) {
 func groupRouteLocked(group model.Group) *RouteState {
 	route := routes[group.ID]
 	if route == nil {
-		route = &RouteState{GroupID: group.ID, Cooldowns: make(map[int]int64)}
+		route = &RouteState{GroupID: group.ID, Cooldowns: make(map[int]int64), provisional: make(map[int]bool)}
 		routes[group.ID] = route
 	}
 	items := make(map[int]bool, len(group.Items))
@@ -251,6 +334,7 @@ func groupRouteLocked(group model.Group) *RouteState {
 	for itemID := range route.Cooldowns {
 		if !items[itemID] {
 			delete(route.Cooldowns, itemID)
+			delete(route.provisional, itemID)
 		}
 	}
 	if route.ProbeItemID != 0 && !items[route.ProbeItemID] {

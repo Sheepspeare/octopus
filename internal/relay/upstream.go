@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/bestruirui/octopus/internal/model"
 	"github.com/bestruirui/octopus/internal/rhttp"
@@ -21,6 +22,41 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 	"github.com/tidwall/gjson"
 )
+
+// upstreamStatusOf 取上游 HTTP 状态码; 非 HTTP 层失败(网络错误, 超时, 协议校验)返回 0。
+// 同协议透传, 流式透传与跨协议转换三条路径都会把上游非 2xx 包装成库的 httpclient.Error, 故统一在此判定。
+func upstreamStatusOf(err error) int {
+	var failure *httpclient.Error
+	if errors.As(err, &failure) {
+		return failure.StatusCode
+	}
+	return 0
+}
+
+// deterministicClientStatus 判断一轮失败是否属于"同一成员再试也不会变"的上游拒绝, 并返回上游状态码。
+// 4xx 中 408(请求超时), 425(过早), 429(限流) 是可恢复的临时状态, 仍按普通失败重试;
+// 其余 4xx 是请求内容或成员配置本身被拒(如凭据失效, 订阅过期, 模型不在该渠道), 对同一成员重复试探没有意义,
+// 但换一个成员仍可能成功, 所以只排除本轮成员而不直接判定请求失败。
+func deterministicClientStatus(err error) (int, bool) {
+	status := upstreamStatusOf(err)
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return 0, false
+	}
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return 0, false
+	}
+	return status, true
+}
+
+// retryAfterOf 取上游在 429 响应里给出的重试间隔; 不是 429 时返回零。
+// 上游没给 Retry-After 时库按 60 秒兜底, 与分组默认冷却时长一致。
+func retryAfterOf(err error) time.Duration {
+	if duration, ok := httpclient.ParseRetryAfter(err); ok {
+		return duration
+	}
+	return 0
+}
 
 // upstreamResponse 是已验证但尚未写给客户端的上游成功响应; events 为 nil 表示非流式响应。
 // 透传响应保留上游响应头; 跨协议响应由客户端协议决定响应头。失败一律以 error 返回。
@@ -122,7 +158,15 @@ func sendPassthroughStream(ctx context.Context, format llm.APIFormat, request *h
 		if readErr != nil {
 			return nil, readErr
 		}
-		return nil, fmt.Errorf("upstream responded %s: %s", response.Status, failure)
+		// 用库的错误类型承载状态码与响应头: 选路要靠它区分"成员故障"与"请求故障", 429 还要读 Retry-After。
+		return nil, fmt.Errorf("%w: %s", &httpclient.Error{
+			Method:     rawRequest.Method,
+			URL:        rawRequest.URL.String(),
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+			Body:       failure,
+			Headers:    response.Header,
+		}, failure)
 	}
 
 	events := httpclient.NewDefaultSSEDecoder(ctx, response.Body)

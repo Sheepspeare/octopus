@@ -96,8 +96,13 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, requestBody, requestBodyOmitted, c.GetInt("api_key_id"))
 		ctx := request.requestCtx
 		requestStartedAt := time.Now() // 总预算起点, 覆盖全部重试与退避等待。
-		failedItemID := 0              // 当前累计连续失败次数的成员 ID。
-		failures := 0                  // 该成员包含首次请求的连续失败次数。
+		// 失败次数按成员分别累计: 轮询模式下成员会交替, 只记"当前成员"的连续失败会让冷却永远不触发。
+		failuresByItem := make(map[int]int)
+		// 本请求内已被上游确定性拒绝的成员, 不再参与后续轮次的选择, 但仍保留在 suspects 里等待确认。
+		excluded := make(map[int]bool)
+		// suspects 是"对本请求失败、但对别的成员可能正常"的成员; 只要本次请求最终由别的成员成功,
+		// 就说明问题在成员侧, 这些成员随即进入冷却。反过来若所有成员都给出同类错误, 则判定问题在请求本身。
+		suspects := make(map[int]bool)
 
 		for {
 			if ctx.Err() != nil {
@@ -126,8 +131,15 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 
 			// 手动模式取人工指定的成员, 故障转移模式按优先级选择未禁用且不在冷却中的成员。
 			// 没有目标时等待重新选择, 期间人工切换渠道, 补齐成员或成员冷却到期即可让请求继续。
-			item := pickGroupItem(group)
+			item := pickGroupItem(group, excluded)
 			if item.ID == 0 {
+				// 成员集合为空说明渠道或凭据全部被禁用, 等待不会自愈, 直接说明原因而不是空转到总预算。
+				if len(group.Items) == 0 {
+					noMember := errors.New("no available member in this group")
+					request.markFailed(noMember, "", nil)
+					rejectRequestWithStatus(c, inbound, http.StatusServiceUnavailable, noMember)
+					return
+				}
 				if !request.wait(ctx, group.RelayConfig.MemberRetryIntervalSeconds) {
 					return
 				}
@@ -243,15 +255,35 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 				_ = op.ChannelModelStatsUpdate(channelModel.ID, metrics)
 				_ = op.ChannelKeyStatsUpdate(channelKey.ID, metrics)
 
-				// 成员改变时重新开始累计该成员在本请求内的连续失败次数。
-				if failedItemID == item.ID {
-					failures++
-				} else {
-					failedItemID = item.ID
-					failures = 1
+				// 手动模式只有一个成员可选, 冷却与换成员都不适用: 按普通失败处理, 期间人工仍可切换渠道。
+				if group.Mode != model.GroupModeManual {
+					// 429 按上游给出的重试间隔直接冷却, 不再对同一成员重复试探。
+					if retryAfter := retryAfterOf(err); retryAfter > 0 {
+						if recordRouteFailure(group, item.ID, group.RelayConfig.MemberMaxAttempts, retryAfter) {
+							continue
+						}
+					}
+					// 确定性 4xx(凭据失效, 订阅过期, 模型不在该渠道等)对同一成员再试结果不变, 直接换成员。
+					// 这里先不冷却: 也可能是请求本身有问题, 冷却与否留到"别的成员是否成功"揭晓后再定。
+					if status, deterministic := deterministicClientStatus(err); deterministic {
+						excluded[item.ID] = true
+						suspects[item.ID] = true
+						// 先压一个临时冷却, 让同批并发请求立刻绕开这个成员, 避免一个坏成员被整批请求各撞一次。
+						markRouteSuspect(group, item.ID)
+						// 每个成员都对同一请求给出确定性拒绝, 说明问题在请求本身: 立刻把上游错误返回,
+						// 不必空等到总预算, 也不必把成员一个个打入冷却。
+						if allItemsExcluded(group, excluded) {
+							clearRouteSuspects(group, suspects)
+							request.markFailed(err, "", nil)
+							rejectRequestWithStatus(c, inbound, status, err)
+							return
+						}
+						continue
+					}
 				}
+				failuresByItem[item.ID]++
 				// 达到总尝试次数时成员进入冷却并立即重新选路, 否则等待后重试。
-				if recordRouteFailure(group, item.ID, failures) {
+				if recordRouteFailure(group, item.ID, failuresByItem[item.ID], 0) {
 					continue
 				}
 				if !request.wait(ctx, group.RelayConfig.MemberRetryIntervalSeconds) {
@@ -270,6 +302,11 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 			roundWaitTime := time.Since(roundStartedAt).Milliseconds() // 流式响应统计到启动事件可以提交为止。
 			// 上游成功后解除该成员的冷却与探测占用, 并按路由配置开始亲和。
 			recordRouteSuccess(group, item.ID)
+			// 同一请求已被别的成员正常承接, 之前给出确定性拒绝的成员即确认为成员侧故障, 逐个打入冷却。
+			for suspectID := range suspects {
+				recordRouteFailure(group, suspectID, group.RelayConfig.MemberMaxAttempts, 0)
+			}
+			clear(suspects)
 			// 同协议透传时原样返回上游响应头; 跨协议响应没有需要透传的响应头。
 			for key, values := range result.header {
 				c.Writer.Header()[key] = values
