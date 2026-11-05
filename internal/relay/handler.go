@@ -27,7 +27,8 @@ import (
 // requestTotalBudget 限制单个请求在选路重试上的总耗时。
 // 上游长期不可用时, 每轮失败只刷新成员冷却而不返回错误, 没有这个上限连接会被一直占用,
 // 客户端只能看到长时间静默, 成员也在冷却与重试之间反复循环。
-const requestTotalBudget = 10 * time.Minute
+// 取 5 分钟: 覆盖"成员全部冷却一轮(默认 60 秒)后再试一次"所需的等待, 又不至于让客户端挂太久。
+const requestTotalBudget = 5 * time.Minute
 
 // Forward 按客户端协议承载一个请求的完整转发过程: 解析请求, 定位分组, 循环选目标请求上游, 直至提交响应或请求结束。
 func Forward(format llm.APIFormat) gin.HandlerFunc {
