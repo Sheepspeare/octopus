@@ -330,8 +330,9 @@ func recordToState(record model.RelayLog) *RequestState {
 		TargetChannelKey:   record.TargetChannelKey,
 		TargetModel:        record.TargetModel,
 		TargetProtocol:     model.Protocol(record.TargetProtocol),
-		Error:              record.Error,
-		RequestBodyOmitted: record.RequestBodyOmitted,
+		Error:               record.Error,
+		RequestBodyOmitted:  record.RequestBodyOmitted,
+		ResponseBodyOmitted: record.ResponseBodyOmitted,
 	}
 }
 

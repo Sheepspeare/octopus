@@ -273,7 +273,7 @@ function LogDetail({ log }: { log: RelayLogOverview }) {
     const [switchingItemId, setSwitchingItemId] = useState<number | null>(null);
     const [now, setNow] = useState(() => Date.now()); // 成员状态与进行中耗时都要随时钟走动。
     const requestBody = useLogRequestBody(log.id, log.started_at, detailReady && leftTab === 'request' && !log.request_body_omitted);
-    const responseBody = useLogResponseBody(log.id, log.started_at, detailReady && log.status === 'success');
+    const responseBody = useLogResponseBody(log.id, log.started_at, detailReady && log.status === 'success' && !log.response_body_omitted);
     const { data: activeGroup } = useGroup(log.group_id, detailReady, detailReady);
     const updateActiveItem = useUpdateGroup();
     const stopRequest = useStopRequest();
@@ -552,6 +552,11 @@ function LogDetail({ log }: { log: RelayLogOverview }) {
                                 </div>
                             ) : requestFailed ? (
                                 <JsonContent content={errorText} fallbackText={t('noResponseContent')} />
+                            ) : log.response_body_omitted ? (
+                                <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-xs text-muted-foreground">
+                                    <EyeOff className="size-5" />
+                                    <span>{t('responseBodyOmitted')}</span>
+                                </div>
                             ) : responseBody.isLoading ? (
                                 <div className="flex h-full items-center justify-center">
                                     <Loader2 className="size-5 animate-spin text-muted-foreground" />

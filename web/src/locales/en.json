@@ -167,6 +167,10 @@
             "label": "Record request body",
             "hint": "When off, request bodies are no longer stored with logs, which greatly reduces log size for image requests. Only affects new requests; existing logs stay unchanged"
         },
+        "logResponseBody": {
+            "label": "Record response body",
+            "hint": "When off, response bodies are no longer stored with logs, useful when only usage and latency matter. Only affects new requests"
+        },
         "restart": {
             "label": "Restart service",
             "button": "Restart now",
@@ -425,6 +429,7 @@
             "images": "Image attachments: {count}",
             "noRequestContent": "(No request content)",
             "requestBodyOmitted": "Request body not recorded: \"Record request body\" is turned off in settings",
+            "responseBodyOmitted": "Response body not recorded: \"Record response body\" is turned off in settings",
             "noResponseContent": "(No response content)",
             "tokens": "tokens",
             "retryIndex": "Retry {index}",

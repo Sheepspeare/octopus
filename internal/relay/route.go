@@ -178,10 +178,78 @@ func allItemsExcluded(group model.Group, exclude map[int]bool) bool {
 	return true
 }
 
+// cooldownWaitLimit 是没有可选成员时单次等待的上限。
+// 冷却通常长达一分钟, 按重试间隔反复醒来只是空转; 但也不能一睡到底,
+// 否则人工改配置(切渠道, 补成员, 关冷却)要等到冷却到期才生效。
+const cooldownWaitLimit = 10 * time.Second
+
+// routeWaitSeconds 决定"本轮没有可选成员"时该等多久。
+// 有成员在冷却就等到最早的一个到期, 让请求在成员恢复的瞬间被接住; 没有成员在冷却(例如成员刚被删除)
+// 则退回配置的重试间隔。上限是 cooldownWaitLimit, 保证配置变化最多 10 秒内生效。
+func routeWaitSeconds(group model.Group, exclude map[int]bool) int {
+	remaining := earliestCooldownRemaining(group, exclude)
+	if remaining <= 0 {
+		return group.RelayConfig.MemberRetryIntervalSeconds
+	}
+	// 向上取整, 避免提前醒来又立刻空转一轮。
+	seconds := int((remaining + time.Second - 1) / time.Second)
+	if seconds > int(cooldownWaitLimit/time.Second) {
+		seconds = int(cooldownWaitLimit / time.Second)
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
+// earliestCooldownRemaining 返回分组内未被排除成员里最早的冷却剩余时长; 没有成员在冷却时返回 0。
+func earliestCooldownRemaining(group model.Group, exclude map[int]bool) time.Duration {
+	if group.Mode == model.GroupModeManual {
+		return 0
+	}
+
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	route := routes[group.ID]
+	if route == nil {
+		return 0
+	}
+	now := time.Now().UnixMilli()
+	var earliest int64
+	for _, item := range group.Items {
+		if exclude[item.ID] {
+			continue
+		}
+		deadline, cooling := route.Cooldowns[item.ID]
+		if !cooling || deadline <= now {
+			continue
+		}
+		if earliest == 0 || deadline < earliest {
+			earliest = deadline
+		}
+	}
+	if earliest == 0 {
+		return 0
+	}
+	return time.Duration(earliest-now) * time.Millisecond
+}
+
 // provisionalCooldown 是确定性 4xx 的临时冷却时长。
 // 它只需要覆盖"同一批并发请求都在飞"的窗口: 请求成功换成员后立刻升级为正式冷却,
 // 请求本身有问题时会在所有成员都试过后整条撤销, 因此这个值只是兜底上限。
 const provisionalCooldown = 15 * time.Second
+
+// deterministicCooldownFloor 是确定性 4xx 成员被确认故障后的冷却下限。
+// 这类成员对同一请求反复拒绝(凭据失效, 订阅过期, 模型不在该渠道), 恢复通常不会发生在配置的短冷却内:
+// 按默认 60 秒冷却, 每个冷却周期都会有一个新请求先撞它一次再换人。用 5 分钟下限把这个代价压到可忽略,
+// 同时又不至于长到上游续订后无法自行恢复。
+const deterministicCooldownFloor = 5 * time.Minute
+
+// deterministicCooldown 返回确定性 4xx 成员被确认故障后的冷却时长, 取配置值与下限中的较大者。
+func deterministicCooldown(group model.Group) time.Duration {
+	return max(time.Duration(group.RelayConfig.MemberCooldownSeconds)*time.Second, deterministicCooldownFloor)
+}
 
 // markRouteSuspect 给返回确定性 4xx 的成员压一个临时冷却, 让同批并发请求立刻绕开它。
 func markRouteSuspect(group model.Group, itemID int) {

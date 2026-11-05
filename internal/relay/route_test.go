@@ -232,3 +232,67 @@ func upstreamError(status int) error {
 		Body:       []byte("upstream body"),
 	})
 }
+
+// TestRouteWaitSecondsFollowsEarliestCooldown 验证没有可选成员时等到最早冷却到期, 而不是按重试间隔反复空转。
+func TestRouteWaitSecondsFollowsEarliestCooldown(t *testing.T) {
+	group := newTestGroup(t, model.GroupModeRoundRobin, 1, 2)
+	// 成员 1 冷却 8 秒, 成员 2 冷却 30 秒: 应等 8 秒那个先恢复。
+	recordRouteFailure(group, 1, group.RelayConfig.MemberMaxAttempts, 8*time.Second)
+	recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 30*time.Second)
+
+	seconds := routeWaitSeconds(group, nil)
+	if seconds < 6 || seconds > 8 {
+		t.Fatalf("等待秒数 = %d, 期望约 8", seconds)
+	}
+}
+
+// TestRouteWaitSecondsCapsAtLimit 验证长冷却不会让请求一睡到底, 配置变化仍需在 10 秒内生效。
+func TestRouteWaitSecondsCapsAtLimit(t *testing.T) {
+	group := newTestGroup(t, model.GroupModeRoundRobin, 1)
+	recordRouteFailure(group, 1, group.RelayConfig.MemberMaxAttempts, 5*time.Minute)
+
+	if seconds := routeWaitSeconds(group, nil); seconds != int(cooldownWaitLimit/time.Second) {
+		t.Fatalf("等待秒数 = %d, 期望 %d", seconds, int(cooldownWaitLimit/time.Second))
+	}
+}
+
+// TestRouteWaitSecondsFallsBackToRetryInterval 验证没有成员在冷却时退回配置的重试间隔。
+func TestRouteWaitSecondsFallsBackToRetryInterval(t *testing.T) {
+	group := newTestGroup(t, model.GroupModeRoundRobin, 1)
+	if seconds := routeWaitSeconds(group, nil); seconds != group.RelayConfig.MemberRetryIntervalSeconds {
+		t.Fatalf("等待秒数 = %d, 期望 %d", seconds, group.RelayConfig.MemberRetryIntervalSeconds)
+	}
+}
+
+// TestRouteWaitSecondsIgnoresExcludedMembers 验证本请求已排除的成员不参与最早冷却计算。
+func TestRouteWaitSecondsIgnoresExcludedMembers(t *testing.T) {
+	group := newTestGroup(t, model.GroupModeRoundRobin, 1, 2)
+	recordRouteFailure(group, 1, group.RelayConfig.MemberMaxAttempts, 3*time.Second)
+	recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 7*time.Second)
+
+	// 成员 1 已被本请求排除, 只该看成员 2 的 7 秒。
+	seconds := routeWaitSeconds(group, map[int]bool{1: true})
+	if seconds < 5 || seconds > 7 {
+		t.Fatalf("等待秒数 = %d, 期望约 7", seconds)
+	}
+}
+
+// TestDeterministicCooldownUsesFloor 验证确定性 4xx 的冷却不低于 5 分钟, 避免每个冷却周期都被撞一次。
+func TestDeterministicCooldownUsesFloor(t *testing.T) {
+	group := testGroup(model.GroupModeRoundRobin, 1)
+	group.RelayConfig.MemberCooldownSeconds = 60
+
+	if cooldown := deterministicCooldown(group); cooldown != deterministicCooldownFloor {
+		t.Fatalf("冷却 = %s, 期望 %s", cooldown, deterministicCooldownFloor)
+	}
+}
+
+// TestDeterministicCooldownKeepsLargerConfig 验证配置的冷却比下限更长时以配置为准。
+func TestDeterministicCooldownKeepsLargerConfig(t *testing.T) {
+	group := testGroup(model.GroupModeRoundRobin, 1)
+	group.RelayConfig.MemberCooldownSeconds = 900
+
+	if cooldown := deterministicCooldown(group); cooldown != 15*time.Minute {
+		t.Fatalf("冷却 = %s, 期望 15m", cooldown)
+	}
+}

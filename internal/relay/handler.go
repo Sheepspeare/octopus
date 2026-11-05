@@ -85,15 +85,10 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 		if parsed, parseErr := inbound.TransformRequest(c.Request.Context(), raw); parseErr == nil {
 			reasoningEffort = parsed.ReasoningEffort
 		}
-		// 请求体记录可由设置关闭: 带图请求动辄数 MB, 不需要排查时关掉能显著降低日志占用。
-		// 关闭后仍登记标记, 使详情能显示"未记录"而不是让人误以为请求本身为空。
-		requestBody := string(raw.Body)
-		requestBodyOmitted := false
-		if recordBody, settingErr := op.SettingGetBool(model.SettingKeyLogRequestBody); settingErr == nil && !recordBody {
-			requestBody = ""
-			requestBodyOmitted = true
-		}
-		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, requestBody, requestBodyOmitted, c.GetInt("api_key_id"))
+		// 请求体与响应体是否留存由系统设置决定, 统一在 newRequestState 里读一次:
+		// 带图请求与流式响应动辄数 MB, 不需要排查时关掉能显著降低内存与磁盘占用;
+		// 关闭后仍登记标记, 使详情显示"未记录"而不是让人误以为内容本身为空。
+		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, string(raw.Body), c.GetInt("api_key_id"))
 		ctx := request.requestCtx
 		requestStartedAt := time.Now() // 总预算起点, 覆盖全部重试与退避等待。
 		// 失败次数按成员分别累计: 轮询模式下成员会交替, 只记"当前成员"的连续失败会让冷却永远不触发。
@@ -140,7 +135,8 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 					rejectRequestWithStatus(c, inbound, http.StatusServiceUnavailable, noMember)
 					return
 				}
-				if !request.wait(ctx, group.RelayConfig.MemberRetryIntervalSeconds) {
+				// 全部成员都在冷却: 等到最早的一个到期再试, 而不是按重试间隔反复空转。
+				if !request.wait(ctx, routeWaitSeconds(group, excluded)) {
 					return
 				}
 				continue
@@ -303,8 +299,9 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 			// 上游成功后解除该成员的冷却与探测占用, 并按路由配置开始亲和。
 			recordRouteSuccess(group, item.ID)
 			// 同一请求已被别的成员正常承接, 之前给出确定性拒绝的成员即确认为成员侧故障, 逐个打入冷却。
+			// 这类故障不会在几十秒内自愈, 用更长的冷却避免每个周期都被新请求先撞一次。
 			for suspectID := range suspects {
-				recordRouteFailure(group, suspectID, group.RelayConfig.MemberMaxAttempts, 0)
+				recordRouteFailure(group, suspectID, group.RelayConfig.MemberMaxAttempts, deterministicCooldown(group))
 			}
 			clear(suspects)
 			// 同协议透传时原样返回上游响应头; 跨协议响应没有需要透传的响应头。

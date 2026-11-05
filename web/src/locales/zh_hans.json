@@ -167,6 +167,10 @@
             "label": "记录请求体",
             "hint": "关闭后日志详情不再保存请求原文，可大幅降低带图请求的日志占用；只影响之后的请求，历史日志不变"
         },
+        "logResponseBody": {
+            "label": "记录响应体",
+            "hint": "关闭后日志详情不再保存响应原文，适合只想看用量与耗时、不希望留存模型输出的场景；只影响之后的请求"
+        },
         "restart": {
             "label": "重启服务",
             "button": "立即重启",
@@ -425,6 +429,7 @@
             "images": "图片附件 {count} 张",
             "noRequestContent": "(无请求内容)",
             "requestBodyOmitted": "请求体未记录：系统设置中已关闭「记录请求体」",
+            "responseBodyOmitted": "响应体未记录：系统设置中已关闭「记录响应体」",
             "noResponseContent": "(无响应内容)",
             "tokens": "词元",
             "retryIndex": "重试 {index}",

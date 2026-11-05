@@ -49,16 +49,18 @@ type RequestState struct {
 	TargetProtocol     model.Protocol `json:"target_protocol"`                // 最新一轮实际请求上游的协议, 与 Protocol 不同即本轮做了跨协议转换; 0 表示尚未选出。
 	Sending            bool           `json:"sending"`                        // 最新一轮是否仍在等待上游响应。
 	Error              string         `json:"error,omitempty"`                // 最新一轮的失败原因, 请求结束后即为最终错误。
-	RequestBodyOmitted bool           `json:"request_body_omitted,omitempty"` // 请求体因设置关闭而未记录, 供界面区分"未记录"与"内容为空"。
+	RequestBodyOmitted bool           `json:"request_body_omitted,omitempty"`  // 请求体因设置关闭而未记录, 供界面区分"未记录"与"内容为空"。
+	ResponseBodyOmitted bool          `json:"response_body_omitted,omitempty"` // 响应体因设置关闭而未记录, 语义同上。
 
-	requestBody   string             // 客户端原始请求体, 体积大故不进状态流, 由独立接口按需拉取。
-	responseBody  string             // 聚合后的完整最终响应体, 同样按需拉取。
-	apiKeyID      int                // 发起请求的 API Key ID, 用于请求完成后的归属统计。
-	requestCtx    context.Context    // 请求级上下文, 同时约束等待、当前轮次和后续重试。
-	requestCancel context.CancelFunc // 中止整个请求, 同时打断等待、当前轮次和后续重试。
-	roundCancel   context.CancelFunc // 中止最新一轮上游请求, 仅在该轮等待响应期间非空。
-	lastPublish   time.Time          // 上次向状态流发布快照的时间, 输出字符数按此节流发布。
-	streamStarted time.Time          // 流式响应首字节提交时间, 用于计算实际流式传输耗时。
+	requestBody      string             // 客户端原始请求体, 体积大故不进状态流, 由独立接口按需拉取。
+	responseBody     string             // 聚合后的完整最终响应体, 同样按需拉取。
+	omitResponseBody bool               // 响应体记录已关闭: 终态写入时直接丢弃正文, 省下内存与磁盘。
+	apiKeyID         int                // 发起请求的 API Key ID, 用于请求完成后的归属统计。
+	requestCtx       context.Context    // 请求级上下文, 同时约束等待、当前轮次和后续重试。
+	requestCancel    context.CancelFunc // 中止整个请求, 同时打断等待、当前轮次和后续重试。
+	roundCancel      context.CancelFunc // 中止最新一轮上游请求, 仅在该轮等待响应期间非空。
+	lastPublish      time.Time          // 上次向状态流发布快照的时间, 输出字符数按此节流发布。
+	streamStarted    time.Time          // 流式响应首字节提交时间, 用于计算实际流式传输耗时。
 }
 
 const streamBuffer = 16                              // 单个状态流连接的非阻塞消息缓冲容量。
@@ -92,25 +94,34 @@ func capBody(body string) string {
 }
 
 // newRequestState 分配请求 ID 并登记初始运行状态; 返回的记录是本请求后续全部状态写入的入口。
-// bodyOmitted 为真表示调用方按设置关闭了请求体记录, 此时 body 为空且界面应展示"未记录"而非"无内容"。
-func newRequestState(ctx context.Context, modelName, reasoningEffort string, groupID int, protocol model.Protocol, body string, bodyOmitted bool, apiKeyID int) *RequestState {
+// 请求体与响应体是否留存由系统设置决定, 在请求到达时读一次, 保证同一请求的两个口径一致;
+// 关闭记录时正文不占内存也不落盘, 记录本身照常生成, 界面按 omitted 标记展示"未记录"。
+func newRequestState(ctx context.Context, modelName, reasoningEffort string, groupID int, protocol model.Protocol, body string, apiKeyID int) *RequestState {
 	requestCtx, requestCancel := context.WithCancel(ctx)
 	mu.Lock()
 	defer mu.Unlock()
 
 	request := &RequestState{
-		ID:                 idSeq.Add(1),
-		Status:             StatusRunning,
-		StartedAt:          time.Now(),
-		Model:              modelName,
-		ReasoningEffort:    reasoningEffort,
-		Protocol:           protocol,
-		GroupID:            groupID,
-		RequestBodyOmitted: bodyOmitted,
-		requestBody:        capBody(body),
-		apiKeyID:           apiKeyID,
-		requestCtx:         requestCtx,
-		requestCancel:      requestCancel,
+		ID:              idSeq.Add(1),
+		Status:          StatusRunning,
+		StartedAt:       time.Now(),
+		Model:           modelName,
+		ReasoningEffort: reasoningEffort,
+		Protocol:        protocol,
+		GroupID:         groupID,
+		apiKeyID:        apiKeyID,
+		requestCtx:      requestCtx,
+		requestCancel:   requestCancel,
+	}
+	// 读取失败按"记录"处理: 设置表异常不应导致日志突然只剩元数据。
+	if record, err := op.SettingGetBool(model.SettingKeyLogRequestBody); err == nil && !record {
+		request.RequestBodyOmitted = true
+	} else {
+		request.requestBody = capBody(body)
+	}
+	if record, err := op.SettingGetBool(model.SettingKeyLogResponseBody); err == nil && !record {
+		request.ResponseBodyOmitted = true
+		request.omitResponseBody = true
 	}
 	// 登记时保存名称快照, 查询失败时留空。
 	if apiKey, err := op.APIKeyGet(apiKeyID, ctx); err == nil {
@@ -242,7 +253,7 @@ func (r *RequestState) markSucceeded(responseBody string, usage *llm.Usage) {
 
 	r.Status = StatusSuccess
 	r.Error = ""
-	r.responseBody = capBody(responseBody)
+	r.keepResponseLocked(responseBody)
 	r.finishLocked(usage)
 }
 
@@ -259,7 +270,7 @@ func (r *RequestState) markFailed(err error, responseBody string, usage *llm.Usa
 		r.Error = err.Error()
 	}
 	if responseBody != "" {
-		r.responseBody = capBody(responseBody)
+		r.keepResponseLocked(responseBody)
 	}
 	r.finishLocked(usage)
 }
@@ -273,9 +284,18 @@ func (r *RequestState) markCanceled(err error, responseBody string, usage *llm.U
 	r.Error = err.Error()
 	if responseBody != "" {
 		// 与其他两个终态一致: 被取消的超长流式响应同样按上限收敛, 避免整段落进内存与待写队列。
-		r.responseBody = capBody(responseBody)
+		r.keepResponseLocked(responseBody)
 	}
 	r.finishLocked(usage)
+}
+
+// keepResponseLocked 在允许记录响应体时保存正文, 关闭记录时直接丢弃; 调用方必须持有锁。
+// 丢弃放在这里而不是落盘处, 是因为流式响应聚合后的正文本身可达数 MB, 留在内存里同样占常驻占用。
+func (r *RequestState) keepResponseLocked(body string) {
+	if r.omitResponseBody || body == "" {
+		return
+	}
+	r.responseBody = capBody(body)
 }
 
 // finishLocked 写入用量和费用, 发布终态, 更新请求级统计并裁剪历史; 调用方必须持有锁。
@@ -354,8 +374,9 @@ func recordOf(request *RequestState) model.RelayLog {
 		TargetChannelKey:   request.TargetChannelKey,
 		TargetModel:        request.TargetModel,
 		TargetProtocol:     uint8(request.TargetProtocol),
-		Error:              request.Error,
-		RequestBodyOmitted: request.RequestBodyOmitted,
+		Error:               request.Error,
+		RequestBodyOmitted:  request.RequestBodyOmitted,
+		ResponseBodyOmitted: request.ResponseBodyOmitted,
 	}
 }
 

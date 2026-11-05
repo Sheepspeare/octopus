@@ -16,6 +16,7 @@ export const SettingKey = {
     CORSAllowOrigins: 'cors_allow_origins',
     ModelFilter: 'model_filter',
     LogRequestBody: 'log_request_body',
+    LogResponseBody: 'log_response_body',
 } as const;
 
 /**

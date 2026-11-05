@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -54,7 +55,7 @@ func buildOutbound(channel model.Channel, grant model.ChannelGrant, channelKey m
 var clientHeaderPlaceholder = regexp.MustCompile(`\{client_header:[^}]+\}`)
 
 // applyChannelConfig 为上游请求补充渠道配置的默认参数并追加自定义 Header; model 与 stream 由转发流程决定, 不允许覆盖。
-// 参数按缺省值语义处理: 客户端已经显式提供同名字段时保留客户端值, 只有客户端没传才填入渠道配置,
+// 参数按缺省值语义处理: 客户端已经显式提供的键保留客户端值, 只有客户端没给的键才填入渠道配置,
 // 由此渠道配置只决定"没指定时用什么", 不会悄悄改掉调用方明确要求的参数。
 func applyChannelConfig(channel model.Channel, request *httpclient.Request) error {
 	if channel.ParamOverride != "" {
@@ -73,9 +74,15 @@ func applyChannelConfig(channel model.Channel, request *httpclient.Request) erro
 			if key == "model" || key == "stream" {
 				continue
 			}
-			// 客户端已显式提供该字段(含显式 null)时不做任何改动, 保证调用方参数优先。
-			if _, ok := present[key]; ok {
-				continue
+			// 客户端已提供该键时按子键补齐缺省值, 客户端自己写过的子键一律保留。
+			// 只判顶层键是否存在的旧做法会让 {"thinking":{"budget_tokens":1024}} 把整个 thinking 默认值跳过,
+			// 结果是调用方只调了一个子键, 却把渠道配的 type=disabled 一并丢掉。
+			if existing, ok := present[key]; ok {
+				merged, changed := mergeJSONDefaults(existing, value)
+				if !changed {
+					continue
+				}
+				value = merged
 			}
 			next, err := sjson.SetRawBytes(body, ":"+escape.Replace(key), value)
 			if err != nil {
@@ -101,4 +108,43 @@ func applyChannelConfig(channel model.Channel, request *httpclient.Request) erro
 		request.Headers.Set(header.HeaderKey, value)
 	}
 	return nil
+}
+
+// mergeJSONDefaults 把 defaults 里 client 缺失的键补进去, 两边同为 JSON 对象时递归合并,
+// 使 thinking.type 这类嵌套默认值在客户端只给出部分子键时依然生效。
+// 返回合并结果与是否发生变化; 客户端值不是对象(含显式 null)时原样保留, 由调用方继续沿用客户端值。
+func mergeJSONDefaults(client, defaults json.RawMessage) (json.RawMessage, bool) {
+	var clientObject, defaultObject map[string]json.RawMessage
+	if json.Unmarshal(client, &clientObject) != nil || json.Unmarshal(defaults, &defaultObject) != nil {
+		return client, false
+	}
+	// 显式 null 与标量都会解成 nil, 都不是可合并的对象。
+	if clientObject == nil || defaultObject == nil {
+		return client, false
+	}
+	changed := false
+	for key, value := range defaultObject {
+		existing, ok := clientObject[key]
+		if !ok {
+			clientObject[key] = value
+			changed = true
+			continue
+		}
+		merged, subChanged := mergeJSONDefaults(existing, value)
+		if subChanged {
+			clientObject[key] = merged
+			changed = true
+		}
+	}
+	if !changed {
+		return client, false
+	}
+	// 关闭 HTML 转义, 否则正文里的 <, >, & 会被改写成 \u003c 这类形式, 徒增困惑。
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(clientObject); err != nil {
+		return client, false
+	}
+	return bytes.TrimRight(buffer.Bytes(), "\n"), true
 }

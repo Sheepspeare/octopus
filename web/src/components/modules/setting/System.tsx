@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'use-intl';
-import { Monitor, Globe, Clock, Shield, Filter, FileText, HelpCircle, X, RotateCw, Loader2, Power } from 'lucide-react';
+import { Monitor, Globe, Clock, Shield, Filter, FileText, FileOutput, HelpCircle, X, RotateCw, Loader2, Power } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -28,6 +28,7 @@ export function SettingSystem() {
     const [corsInputValue, setCorsInputValue] = useState('');
     const [modelFilter, setModelFilter] = useState('');
     const [logRequestBody, setLogRequestBody] = useState(true);
+    const [logResponseBody, setLogResponseBody] = useState(true);
     const [restarting, setRestarting] = useState(false);
 
     const initialProxyUrl = useRef('');
@@ -35,6 +36,7 @@ export function SettingSystem() {
     const initialCorsAllowOrigins = useRef('');
     const initialModelFilter = useRef('');
     const initialLogRequestBody = useRef(true);
+    const initialLogResponseBody = useRef(true);
 
     useEffect(() => {
         if (settings) {
@@ -43,6 +45,7 @@ export function SettingSystem() {
             const cors = settings.find(s => s.key === SettingKey.CORSAllowOrigins);
             const modelFilterSetting = settings.find(s => s.key === SettingKey.ModelFilter);
             const logRequestBodySetting = settings.find(s => s.key === SettingKey.LogRequestBody);
+            const logResponseBodySetting = settings.find(s => s.key === SettingKey.LogResponseBody);
             if (proxy) {
                 queueMicrotask(() => setProxyUrl(proxy.value));
                 initialProxyUrl.current = proxy.value;
@@ -64,6 +67,11 @@ export function SettingSystem() {
                 const enabled = logRequestBodySetting.value !== 'false';
                 queueMicrotask(() => setLogRequestBody(enabled));
                 initialLogRequestBody.current = enabled;
+            }
+            if (logResponseBodySetting) {
+                const enabled = logResponseBodySetting.value !== 'false';
+                queueMicrotask(() => setLogResponseBody(enabled));
+                initialLogResponseBody.current = enabled;
             }
         }
     }, [settings]);
@@ -142,16 +150,28 @@ export function SettingSystem() {
     };
 
     // 记录请求体开关: 立即保存并生效, 只影响之后发起的请求, 已落盘的正文不会被清理。
-    const handleToggleLogRequestBody = (enabled: boolean) => {
-        setLogRequestBody(enabled);
-        if (enabled === initialLogRequestBody.current) return;
-        setSetting.mutate({ key: SettingKey.LogRequestBody, value: String(enabled) }, {
+    // 请求体与响应体两个开关共用一套保存流程: 先乐观切换界面, 再写设置, 成功后更新基准值避免重复提交。
+    const saveBodyLogSetting = (
+        key: string,
+        enabled: boolean,
+        apply: (value: boolean) => void,
+        initial: { current: boolean },
+    ) => {
+        apply(enabled);
+        if (enabled === initial.current) return;
+        setSetting.mutate({ key, value: String(enabled) }, {
             onSuccess: () => {
-                initialLogRequestBody.current = enabled;
+                initial.current = enabled;
                 toast.success(t('saved'));
             },
         });
     };
+
+    const handleToggleLogRequestBody = (enabled: boolean) =>
+        saveBodyLogSetting(SettingKey.LogRequestBody, enabled, setLogRequestBody, initialLogRequestBody);
+
+    const handleToggleLogResponseBody = (enabled: boolean) =>
+        saveBodyLogSetting(SettingKey.LogResponseBody, enabled, setLogResponseBody, initialLogResponseBody);
 
     // 重启流程: 先不带 force 试一次, 后端有在途请求会回 409, 交给用户确认后再强制。
     const runRestart = async (force: boolean) => {
@@ -329,6 +349,30 @@ export function SettingSystem() {
                     onCheckedChange={handleToggleLogRequestBody}
                     disabled={setSetting.isPending}
                     aria-label={t('logRequestBody.label')}
+                />
+            </div>
+
+            {/* 响应体记录开关 */}
+            <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                    <FileOutput className="h-5 w-5 text-muted-foreground" />
+                    <div className="flex items-center gap-1.5">
+                        <span className="text-sm font-medium">{t('logResponseBody.label')}</span>
+                        <Tooltip>
+                            <TooltipTrigger asChild>
+                                <HelpCircle className="size-4 text-muted-foreground cursor-help" />
+                            </TooltipTrigger>
+                            <TooltipContent side="top" sideOffset={10} align="center" className="max-w-64">
+                                {t('logResponseBody.hint')}
+                            </TooltipContent>
+                        </Tooltip>
+                    </div>
+                </div>
+                <Switch
+                    checked={logResponseBody}
+                    onCheckedChange={handleToggleLogResponseBody}
+                    disabled={setSetting.isPending}
+                    aria-label={t('logResponseBody.label')}
                 />
             </div>
 

@@ -167,6 +167,10 @@
             "label": "記錄請求體",
             "hint": "關閉後日誌詳情不再保存請求原文，可大幅降低帶圖請求的日誌佔用；只影響之後的請求，歷史日誌不變"
         },
+        "logResponseBody": {
+            "label": "記錄回應體",
+            "hint": "關閉後日誌詳情不再保存回應原文，適合只想看用量與耗時、不希望留存模型輸出的場景；只影響之後的請求"
+        },
         "restart": {
             "label": "重啟服務",
             "button": "立即重啟",
@@ -425,6 +429,7 @@
             "images": "圖片附件 {count} 張",
             "noRequestContent": "(無請求內容)",
             "requestBodyOmitted": "請求體未記錄：系統設定中已關閉「記錄請求體」",
+            "responseBodyOmitted": "回應體未記錄：系統設定中已關閉「記錄回應體」",
             "noResponseContent": "(無回應內容)",
             "tokens": "詞元",
             "retryIndex": "重試 {index}",
