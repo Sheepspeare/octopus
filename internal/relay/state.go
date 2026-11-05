@@ -270,7 +270,8 @@ func (r *RequestState) markCanceled(err error, responseBody string, usage *llm.U
 	r.Status = StatusCanceled
 	r.Error = err.Error()
 	if responseBody != "" {
-		r.responseBody = responseBody
+		// 与其他两个终态一致: 被取消的超长流式响应同样按上限收敛, 避免整段落进内存与待写队列。
+		r.responseBody = capBody(responseBody)
 	}
 	r.finishLocked(usage)
 }
