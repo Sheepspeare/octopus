@@ -302,6 +302,31 @@ func allItemsExcluded(group model.Group, exclude map[int]bool) bool {
 // 否则人工改配置(切渠道, 补成员, 关冷却)要等到冷却到期才生效。
 const cooldownWaitLimit = 10 * time.Second
 
+// groupSaturated 判断"本轮没有可选成员"是否因为成员的并发上限已满, 而不是冷却或成员被排除。
+// 满员是瞬时的: 槽位通常在一两个请求的耗时内就会腾出, 调用方据此改用亚秒级短等待;
+// 有成员在冷却时返回 false, 等待时长仍由冷却到期时间决定。
+func groupSaturated(group model.Group, exclude map[int]bool) bool {
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	route := groupRouteLocked(group)
+	now := time.Now().UnixMilli()
+	considered := false
+	for _, item := range group.Items {
+		if exclude[item.ID] {
+			continue
+		}
+		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
+			continue
+		}
+		considered = true
+		if itemHasSlot(route, item) {
+			return false
+		}
+	}
+	return considered
+}
+
 // routeWaitSeconds 决定"本轮没有可选成员"时该等多久。
 // 有成员在冷却就等到最早的一个到期, 让请求在成员恢复的瞬间被接住; 没有成员在冷却(例如成员刚被删除)
 // 则退回配置的重试间隔。上限是 cooldownWaitLimit, 保证配置变化最多 10 秒内生效。

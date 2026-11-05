@@ -30,6 +30,10 @@ import (
 // 取 5 分钟: 覆盖"成员全部冷却一轮(默认 60 秒)后再试一次"所需的等待, 又不至于让客户端挂太久。
 const requestTotalBudget = 5 * time.Minute
 
+// saturatedPollInterval 是成员全部满员时的轮询间隔。
+// 取值远小于重试间隔(默认 3 秒): 槽位是瞬时资源, 睡久了会把刚腾出的槽位空置, 直接压低吞吐。
+const saturatedPollInterval = 100 * time.Millisecond
+
 // Forward 按客户端协议承载一个请求的完整转发过程: 解析请求, 定位分组, 循环选目标请求上游, 直至提交响应或请求结束。
 func Forward(format llm.APIFormat) gin.HandlerFunc {
 	// 客户端协议同时定出入站转换器和请求协议位: 后者随请求状态推给界面, 也是每轮选择上游协议的首选。
@@ -140,6 +144,14 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 					request.markFailed(noMember, "", nil)
 					rejectRequestWithStatus(c, inbound, http.StatusServiceUnavailable, noMember)
 					return
+				}
+				// 成员满员只是瞬时的: 槽位通常在一两个请求的耗时内腾出, 用亚秒级短等待接上。
+				// 若按重试间隔(默认 3 秒)睡, 腾出的槽位会空置大半个请求周期, 并发一高吞吐就塌。
+				if groupSaturated(group, excluded) {
+					if !request.waitFor(ctx, saturatedPollInterval) {
+						return
+					}
+					continue
 				}
 				// 全部成员都在冷却: 等到最早的一个到期再试, 而不是按重试间隔反复空转。
 				if !request.wait(ctx, routeWaitSeconds(group, excluded)) {

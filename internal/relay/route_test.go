@@ -397,6 +397,64 @@ func TestPickReturnsZeroWhenAllMembersFull(t *testing.T) {
 	}
 }
 
+// TestGroupSaturatedDetectsFullMembers 验证满员能被识别出来, 归还槽位后立即恢复。
+// 这个判定决定调用方是走亚秒级轮询还是走冷却等待, 判错会把吞吐压下去。
+func TestGroupSaturatedDetectsFullMembers(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{1, 1})
+
+	if groupSaturated(group, nil) {
+		t.Fatalf("还有余量时不应判为满员")
+	}
+	if item := pickGroupItem(group, nil); item.ID == 0 {
+		t.Fatalf("首轮应有成员可选")
+	}
+	if item := pickGroupItem(group, nil); item.ID == 0 {
+		t.Fatalf("第二个成员应还有余量")
+	}
+	if !groupSaturated(group, nil) {
+		t.Fatalf("全部成员占满后应判为满员")
+	}
+	ReleaseItemSlot(group.ID, 1)
+	if groupSaturated(group, nil) {
+		t.Fatalf("归还一个槽位后不应再判为满员")
+	}
+}
+
+// TestGroupSaturatedIgnoresCoolingMembers 验证冷却中的成员不算"满员", 等待时长仍交给冷却到期时间决定。
+func TestGroupSaturatedIgnoresCoolingMembers(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{4, 4})
+	pickAndRelease(group) // 先建立路由状态, 冷却表才有地方可写。
+	for _, id := range []int{1, 2} {
+		if !recordRouteFailure(group, id, group.RelayConfig.MemberMaxAttempts, 0) {
+			t.Fatalf("成员 %d 达到尝试上限后应进入冷却", id)
+		}
+	}
+
+	if groupSaturated(group, nil) {
+		t.Fatalf("全部成员都在冷却时不应判为满员")
+	}
+}
+
+// TestGroupSaturatedSkipsExcludedMembers 验证被排除的成员不计入满员判定。
+func TestGroupSaturatedSkipsExcludedMembers(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{1, 1})
+
+	for range 2 {
+		if item := pickGroupItem(group, nil); item.ID == 0 {
+			t.Fatalf("两个成员各有一个槽位, 应都能选中")
+		}
+	}
+	// 两个成员都已占满, 排除谁都是满员。
+	if !groupSaturated(group, map[int]bool{2: true}) {
+		t.Fatalf("排除成员 2 后成员 1 仍满员, 应判为满员")
+	}
+	// 成员 2 腾出槽位后再排除成员 1, 判定就该看到成员 2 的余量。
+	ReleaseItemSlot(group.ID, 2)
+	if groupSaturated(group, map[int]bool{1: true}) {
+		t.Fatalf("成员 2 已有余量, 不应判为满员")
+	}
+}
+
 // TestReleaseItemSlotReopensCapacity 验证归还槽位后成员重新可选。
 func TestReleaseItemSlotReopensCapacity(t *testing.T) {
 	group := newLimitedGroup(t, model.GroupModeRoundRobin, []int{1}, []int{1})

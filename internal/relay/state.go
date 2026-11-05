@@ -42,15 +42,15 @@ type RequestState struct {
 	Cost               float64        `json:"cost"`                 // 请求结束时写入的累计费用。
 	OutputChars        int            `json:"output_chars"`         // 流式过程中按事件数量估算并实时累计的输出字符数, 仅用于界面展示, 不参与结算。
 
-	Round              int            `json:"round"`                          // 最新一轮循环的递增序号, 人工中止按此匹配以免误杀下一轮。
-	RoundStartedAt     time.Time      `json:"round_started_at"`               // 最新一轮上游请求的开始时间。
-	TargetChannelKey   string         `json:"target_channel_key"`             // 最新一轮选中的渠道名称和 Key 名称, 以空格分隔。
-	TargetModel        string         `json:"target_model"`                   // 最新一轮实际请求上游的模型名称。
-	TargetProtocol     model.Protocol `json:"target_protocol"`                // 最新一轮实际请求上游的协议, 与 Protocol 不同即本轮做了跨协议转换; 0 表示尚未选出。
-	Sending            bool           `json:"sending"`                        // 最新一轮是否仍在等待上游响应。
-	Error              string         `json:"error,omitempty"`                // 最新一轮的失败原因, 请求结束后即为最终错误。
-	RequestBodyOmitted bool           `json:"request_body_omitted,omitempty"`  // 请求体因设置关闭而未记录, 供界面区分"未记录"与"内容为空"。
-	ResponseBodyOmitted bool          `json:"response_body_omitted,omitempty"` // 响应体因设置关闭而未记录, 语义同上。
+	Round               int            `json:"round"`                           // 最新一轮循环的递增序号, 人工中止按此匹配以免误杀下一轮。
+	RoundStartedAt      time.Time      `json:"round_started_at"`                // 最新一轮上游请求的开始时间。
+	TargetChannelKey    string         `json:"target_channel_key"`              // 最新一轮选中的渠道名称和 Key 名称, 以空格分隔。
+	TargetModel         string         `json:"target_model"`                    // 最新一轮实际请求上游的模型名称。
+	TargetProtocol      model.Protocol `json:"target_protocol"`                 // 最新一轮实际请求上游的协议, 与 Protocol 不同即本轮做了跨协议转换; 0 表示尚未选出。
+	Sending             bool           `json:"sending"`                         // 最新一轮是否仍在等待上游响应。
+	Error               string         `json:"error,omitempty"`                 // 最新一轮的失败原因, 请求结束后即为最终错误。
+	RequestBodyOmitted  bool           `json:"request_body_omitted,omitempty"`  // 请求体因设置关闭而未记录, 供界面区分"未记录"与"内容为空"。
+	ResponseBodyOmitted bool           `json:"response_body_omitted,omitempty"` // 响应体因设置关闭而未记录, 语义同上。
 
 	requestBody      string             // 客户端原始请求体, 体积大故不进状态流, 由独立接口按需拉取。
 	responseBody     string             // 聚合后的完整最终响应体, 同样按需拉取。
@@ -240,6 +240,18 @@ func (r *RequestState) wait(ctx context.Context, seconds int) bool {
 	}
 }
 
+// waitFor 按指定时长让出, 供并发闸门这种亚秒级的短暂等待使用; 返回 false 表示请求已被取消。
+// 与 wait 分开是因为后者以秒为单位, 用于冷却与重试间隔, 粒度对一个刚腾出的槽位来说太粗。
+func (r *RequestState) waitFor(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		r.markCanceled(ctx.Err(), "", nil)
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
 // markCommitted 标记响应已提交, 并按响应方式记录最终正确轮次的首字或完整响应耗时。
 func (r *RequestState) markCommitted(streaming bool) {
 	mu.Lock()
@@ -374,26 +386,26 @@ func (r *RequestState) finishLocked(usage *llm.Usage) {
 // recordOf 把内存态转成待落库的记录; 正文体积大, 由调用方单独传给写盘协程, 不在此处拷贝。
 func recordOf(request *RequestState) model.RelayLog {
 	return model.RelayLog{
-		ID:                 request.ID,
-		Status:             string(request.Status),
-		StartedAt:          request.StartedAt,
-		Duration:           request.Duration,
-		FirstTokenDuration: request.FirstTokenDuration,
-		StreamDuration:     request.StreamDuration,
-		ResponseDuration:   request.ResponseDuration,
-		Model:              request.Model,
-		ReasoningEffort:    request.ReasoningEffort,
-		Protocol:           uint8(request.Protocol),
-		GroupID:            request.GroupID,
-		APIKeyName:         request.APIKeyName,
-		PromptTokens:       request.Usage.PromptTokens,
-		CompletionTokens:   request.Usage.CompletionTokens,
-		TotalTokens:        request.Usage.TotalTokens,
-		Cost:               request.Cost,
-		Round:              request.Round,
-		TargetChannelKey:   request.TargetChannelKey,
-		TargetModel:        request.TargetModel,
-		TargetProtocol:     uint8(request.TargetProtocol),
+		ID:                  request.ID,
+		Status:              string(request.Status),
+		StartedAt:           request.StartedAt,
+		Duration:            request.Duration,
+		FirstTokenDuration:  request.FirstTokenDuration,
+		StreamDuration:      request.StreamDuration,
+		ResponseDuration:    request.ResponseDuration,
+		Model:               request.Model,
+		ReasoningEffort:     request.ReasoningEffort,
+		Protocol:            uint8(request.Protocol),
+		GroupID:             request.GroupID,
+		APIKeyName:          request.APIKeyName,
+		PromptTokens:        request.Usage.PromptTokens,
+		CompletionTokens:    request.Usage.CompletionTokens,
+		TotalTokens:         request.Usage.TotalTokens,
+		Cost:                request.Cost,
+		Round:               request.Round,
+		TargetChannelKey:    request.TargetChannelKey,
+		TargetModel:         request.TargetModel,
+		TargetProtocol:      uint8(request.TargetProtocol),
 		Error:               request.Error,
 		RequestBodyOmitted:  request.RequestBodyOmitted,
 		ResponseBodyOmitted: request.ResponseBodyOmitted,
