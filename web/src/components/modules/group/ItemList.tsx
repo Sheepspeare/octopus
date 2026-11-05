@@ -26,6 +26,7 @@ export interface SelectedMember {
     key_name: string;
     protocols: number;
     item_id?: number;
+    max_concurrency: number; // 并发上限，0 表示不限；加权模式下同时是分配权重。
 }
 
 function reorderList<T>(list: T[], startIndex: number, endIndex: number): T[] {
@@ -56,6 +57,8 @@ function MemberItem({
     isRemoving,
     showConfirmDelete = true,
     layoutScope,
+    concurrencyEditable = false,
+    onConcurrencyChange,
     dnd,
 }: {
     member: SelectedMember;
@@ -70,6 +73,8 @@ function MemberItem({
     isRemoving?: boolean;
     showConfirmDelete?: boolean;
     layoutScope?: string;
+    concurrencyEditable?: boolean; // 为真时成员行直接可编辑并发上限，否则只展示已配置的值。
+    onConcurrencyChange?: (id: string, value: number) => void;
     dnd: MemberItemDnd;
 }) {
     const t = useTranslations('group');
@@ -147,6 +152,36 @@ function MemberItem({
                 </div>
 
                 {group && <MemberStatus group={group} itemId={member.item_id} now={now} active={isActive} activeClassName="p-1" />}
+
+                {/* 并发上限既是硬闸门也是加权模式的权重，编辑态直接改，只读态仅在配置过时以角标展示。 */}
+                {concurrencyEditable && onConcurrencyChange ? (
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <input
+                                type="number"
+                                inputMode="numeric"
+                                min={0}
+                                step={1}
+                                value={member.max_concurrency}
+                                aria-label={t('form.concurrency')}
+                                onClick={(event) => event.stopPropagation()}
+                                onKeyDown={(event) => event.stopPropagation()}
+                                onChange={(event) => {
+                                    const value = Number.parseInt(event.target.value, 10);
+                                    onConcurrencyChange(member.id, Number.isFinite(value) && value > 0 ? value : 0);
+                                }}
+                                className="h-6 w-11 shrink-0 rounded-md border border-border/60 bg-background px-1 text-center text-xs tabular-nums outline-none focus-visible:border-border"
+                            />
+                        </TooltipTrigger>
+                        <TooltipContent side="top" sideOffset={10} align="center">
+                            {t('form.concurrencyHint')}
+                        </TooltipContent>
+                    </Tooltip>
+                ) : member.max_concurrency > 0 ? (
+                    <span className="shrink-0 rounded border border-border/60 px-1 text-[10px] leading-4 text-muted-foreground tabular-nums">
+                        {member.max_concurrency}
+                    </span>
+                ) : null}
 
                 {!group && (
                     <>
@@ -258,6 +293,9 @@ interface MemberListProps {
      */
     showConfirmDelete?: boolean;
     layoutScope?: string;
+    /** 为真时成员行可直接编辑并发上限，用于分组编辑态。 */
+    concurrencyEditable?: boolean;
+    onConcurrencyChange?: (id: string, value: number) => void;
 }
 
 export function MemberList({
@@ -275,6 +313,8 @@ export function MemberList({
     removingIds = new Set(),
     showConfirmDelete = true,
     layoutScope: externalLayoutScope,
+    concurrencyEditable = false,
+    onConcurrencyChange,
 }: MemberListProps) {
     const internalLayoutScope = useId();
     const layoutScope = externalLayoutScope ?? internalLayoutScope;
@@ -369,6 +409,8 @@ export function MemberList({
                                 isRemoving={false}
                                 showConfirmDelete={showConfirmDelete}
                                 layoutScope={layoutScope}
+                                concurrencyEditable={concurrencyEditable}
+                                onConcurrencyChange={onConcurrencyChange}
                                 dnd={{
                                     innerRef: draggableProvided.innerRef,
                                     draggableProps: draggableProvided.draggableProps,
@@ -405,6 +447,8 @@ export function MemberList({
                                                 isRemoving={removingIds.has(member.id)}
                                                 showConfirmDelete={showConfirmDelete}
                                                 layoutScope={layoutScope}
+                                                concurrencyEditable={concurrencyEditable}
+                                                onConcurrencyChange={onConcurrencyChange}
                                                 dnd={{
                                                     innerRef: draggableProvided.innerRef,
                                                     draggableProps: draggableProvided.draggableProps,

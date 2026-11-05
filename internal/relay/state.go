@@ -61,6 +61,7 @@ type RequestState struct {
 	roundCancel      context.CancelFunc // 中止最新一轮上游请求, 仅在该轮等待响应期间非空。
 	lastPublish      time.Time          // 上次向状态流发布快照的时间, 输出字符数按此节流发布。
 	streamStarted    time.Time          // 流式响应首字节提交时间, 用于计算实际流式传输耗时。
+	holdItemSlot     int                // 本请求当前占用的成员并发槽位, 0 表示未占用。
 }
 
 const streamBuffer = 16                              // 单个状态流连接的非阻塞消息缓冲容量。
@@ -91,6 +92,25 @@ func capBody(body string) string {
 		return ""
 	}
 	return string(summary)
+}
+
+// holdSlot 登记本轮选路占用的成员并发槽位, 供 releaseSlot 归还。
+func (r *RequestState) holdSlot(itemID int) {
+	mu.Lock()
+	r.holdItemSlot = itemID
+	mu.Unlock()
+}
+
+// releaseSlot 归还本请求占用的成员并发槽位; 每轮选路前与请求退出时各调用一次, 重复调用无副作用。
+// 先取请求锁再取路由锁, 顺序固定: 路由锁内不会回调请求状态, 因此不会反向嵌套。
+func (r *RequestState) releaseSlot() {
+	mu.Lock()
+	itemID := r.holdItemSlot
+	r.holdItemSlot = 0
+	groupID := r.GroupID
+	mu.Unlock()
+
+	ReleaseItemSlot(groupID, itemID)
 }
 
 // newRequestState 分配请求 ID 并登记初始运行状态; 返回的记录是本请求后续全部状态写入的入口。

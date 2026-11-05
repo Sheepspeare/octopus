@@ -26,7 +26,10 @@ export function CreateDialogContent() {
                                 name,
                                 mode,
                                 relay_config,
-                                items: members.map((member) => ({ channel_grant_id: member.channel_grant_id })),
+                                items: members.map((member) => ({
+                                    channel_grant_id: member.channel_grant_id,
+                                    max_concurrency: member.max_concurrency,
+                                })),
                             },
                             {
                                 onSuccess: () => setIsOpen(false),

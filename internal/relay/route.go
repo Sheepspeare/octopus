@@ -21,6 +21,12 @@ type RouteState struct {
 	Cooldowns     map[int]int64 `json:"cooldowns"`       // 失败成员 ID 对应的冷却截止 Unix 毫秒时间, 已到期的条目由前端按当前时间忽略。
 
 	affinityArmed bool // 当前路由下一次成功后是否开始亲和, 仅故障切换后为真。
+	// inflight 记录每个成员当前在途的请求数, 用于执行成员的并发上限; 未配置上限的成员同样计数, 便于排障。
+	// 只在持有 routeMu 时读写, 不导出到 JSON: 前端展示的实时状态不含在途数。
+	inflight map[int]int
+	// weights 是加权轮询的平滑累计权重: 每轮给候选成员加上自身权重, 被选中的成员减去本轮总权重。
+	// 这样既保持长期比例精确, 又不会像固定窗口那样把同一成员的请求挤在一起。
+	weights map[int]int
 	// provisional 标记 Cooldowns 中由确定性 4xx 临时压下的条目。
 	// 这类失败可能是请求本身有问题, 不能立刻算作成员故障; 但同批并发请求都在看着同一份冷却表,
 	// 若不立刻压下, 一个坏成员会在几秒内被每个并发请求各撞一次。故先压一个短冷却,
@@ -72,6 +78,8 @@ func ResetRouteState(groupID int) {
 // 渠道是否可用不在此判断: GroupGetByName 已把渠道或凭据被禁用的成员滤掉, 这里只看路由状态。
 // exclude 是本请求内已经确认不值得再试的成员(例如上游对同一请求返回确定性的 4xx),
 // 排除只作用于当前请求: 请求结束即失效, 是否真正冷却由调用方在确认成员侧故障后决定。
+// 自动模式返回非零成员时已为其占用一个并发槽位, 调用方必须在该轮结束后调用 ReleaseItemSlot 归还;
+// 成员并发上限只在自动模式生效: 手动模式是人工指定"就用它", 不在此处限流。
 func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 	if group.Mode == model.GroupModeManual {
 		for _, item := range group.Items {
@@ -88,18 +96,24 @@ func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 	route := groupRouteLocked(group)
 	now := time.Now().UnixMilli()
 
-	// 轮询模式不看亲和: 每轮都按成员顺序推进, 分摊是否均匀由轮转本身保证。
-	if group.Mode == model.GroupModeRoundRobin {
+	// 轮询与加权模式不看亲和: 分摊是否均匀由轮转或权重本身保证。
+	switch group.Mode {
+	case model.GroupModeRoundRobin:
 		return pickRoundRobinLocked(group, route, now, exclude)
+	case model.GroupModeWeighted:
+		return pickWeightedLocked(group, route, now, exclude)
 	}
 
 	if route.AffinityUntil <= now {
 		route.AffinityUntil = 0
 	}
 
-	// 亲和期内沿用当前成员, 不提前探测已恢复的高优先级成员; 当前成员被排除时立即放弃亲和。
+	// 亲和期内沿用当前成员, 不提前探测已恢复的高优先级成员; 当前成员被排除或满员时放弃亲和。
 	if route.CurrentItemID != 0 && route.AffinityUntil > now && !exclude[route.CurrentItemID] {
-		return itemOf(group, route.CurrentItemID)
+		if item := itemOf(group, route.CurrentItemID); item.ID != 0 && itemHasSlot(route, item) {
+			reserveItemLocked(route, item)
+			return item
+		}
 	}
 
 	for _, item := range group.Items {
@@ -107,12 +121,20 @@ func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 		if exclude[item.ID] {
 			continue
 		}
-		// 遍历到当前成员说明比它优先级更高的成员都不可选, 沿用当前成员。
+		// 遍历到当前成员说明比它优先级更高的成员都不可选: 它仍有余量就沿用, 满员则继续向后找承接者,
+		// 否则整个分组会在一个满员的成员上排队, 而后面明明还有空闲成员。
 		if item.ID == route.CurrentItemID {
-			break
+			if itemHasSlot(route, item) {
+				reserveItemLocked(route, item)
+				return item
+			}
+			continue
 		}
 		deadline, cooling := route.Cooldowns[item.ID]
 		if cooling && deadline > now {
+			continue
+		}
+		if !itemHasSlot(route, item) {
 			continue
 		}
 		// 冷却已到期的成员只放行一个探测请求, 避免全部请求同时涌向尚未恢复的成员。
@@ -121,15 +143,19 @@ func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 				continue
 			}
 			route.ProbeItemID = item.ID
+			reserveItemLocked(route, item)
 			publishRouteLocked(route)
 			return item
 		}
 		route.CurrentItemID = item.ID
+		reserveItemLocked(route, item)
 		publishRouteLocked(route)
 		return item
 	}
-	if route.CurrentItemID != 0 && !exclude[route.CurrentItemID] {
-		return itemOf(group, route.CurrentItemID)
+	// 全部成员都在冷却或满员: 返回零值交给调用方等待, 比对着已知不可用的成员空转更省资源。
+	if item := itemOf(group, route.CurrentItemID); item.ID != 0 && !exclude[item.ID] && itemHasSlot(route, item) {
+		reserveItemLocked(route, item)
+		return item
 	}
 	return model.GroupItem{}
 }
@@ -157,11 +183,104 @@ func pickRoundRobinLocked(group model.Group, route *RouteState, now int64, exclu
 		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
 			continue
 		}
+		// 满员的成员本轮让位: 游标继续推进, 它的份额临时由后面的成员承接。
+		if !itemHasSlot(route, item) {
+			continue
+		}
 		route.CurrentItemID = item.ID
+		reserveItemLocked(route, item)
 		publishRouteLocked(route)
 		return item
 	}
 	return model.GroupItem{}
+}
+
+// pickWeightedLocked 按成员权重做平滑加权轮询, 权重来自成员的并发上限。
+// 每轮给全部候选成员累加自身权重, 取累计值最大者并减去本轮总权重: 长期比例精确, 短期也不会把同一成员连发。
+// 满员与冷却中的成员不参与本轮累计, 它们的份额自然落到仍有余量的成员身上; 全部满员时返回零值交给调用方等待。
+// 调用方必须持有 routeMu。
+func pickWeightedLocked(group model.Group, route *RouteState, now int64, exclude map[int]bool) model.GroupItem {
+	total := 0
+	chosen := model.GroupItem{}
+	for _, item := range group.Items {
+		if exclude[item.ID] {
+			continue
+		}
+		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
+			continue
+		}
+		if !itemHasSlot(route, item) {
+			continue
+		}
+		weight := itemWeight(group, item)
+		route.weights[item.ID] += weight
+		total += weight
+		if chosen.ID == 0 || route.weights[item.ID] > route.weights[chosen.ID] {
+			chosen = item
+		}
+	}
+	if chosen.ID == 0 || total == 0 {
+		return model.GroupItem{}
+	}
+	route.weights[chosen.ID] -= total
+	route.CurrentItemID = chosen.ID
+	reserveItemLocked(route, chosen)
+	publishRouteLocked(route)
+	return chosen
+}
+
+// itemWeight 返回成员在加权轮询中的权重: 配了并发上限就用上限本身, 没配则取组内最大上限,
+// 使"不限并发"的成员与容量最大的成员同权, 由并发闸门决定它实际能承接多少; 全组都没配上限时各成员等权。
+func itemWeight(group model.Group, item model.GroupItem) int {
+	if item.MaxConcurrency > 0 {
+		return item.MaxConcurrency
+	}
+	maxLimit := 0
+	for _, other := range group.Items {
+		if other.MaxConcurrency > maxLimit {
+			maxLimit = other.MaxConcurrency
+		}
+	}
+	if maxLimit > 0 {
+		return maxLimit
+	}
+	return 1
+}
+
+// itemHasSlot 判断成员是否还有并发余量; 未配置上限的成员恒为真。
+func itemHasSlot(route *RouteState, item model.GroupItem) bool {
+	if item.MaxConcurrency <= 0 {
+		return true
+	}
+	return route.inflight[item.ID] < item.MaxConcurrency
+}
+
+// reserveItemLocked 为已通过 itemHasSlot 的成员占用一个并发槽位。
+// 占位与选路在同一把锁内完成, 避免同批并发请求同时看到"最后一个空位"而超发。
+func reserveItemLocked(route *RouteState, item model.GroupItem) {
+	route.inflight[item.ID]++
+}
+
+// ReleaseItemSlot 归还成员的一个并发槽位, 供 Relay 在每轮结束和请求退出时调用。
+// 重复调用或对未占用的成员调用都是安全的: 计数不会降到零以下, 也不会影响冷却与亲和。
+func ReleaseItemSlot(groupID, itemID int) {
+	if itemID == 0 {
+		return
+	}
+
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	route := routes[groupID]
+	if route == nil {
+		return
+	}
+	switch inflight := route.inflight[itemID]; {
+	case inflight > 1:
+		route.inflight[itemID] = inflight - 1
+	case inflight == 1:
+		delete(route.inflight, itemID)
+	}
 }
 
 // allItemsExcluded 判断分组内每个成员是否都已在本次请求中被排除。
@@ -392,7 +511,13 @@ func releaseRouteProbe(group model.Group, itemID int) {
 func groupRouteLocked(group model.Group) *RouteState {
 	route := routes[group.ID]
 	if route == nil {
-		route = &RouteState{GroupID: group.ID, Cooldowns: make(map[int]int64), provisional: make(map[int]bool)}
+		route = &RouteState{
+			GroupID:     group.ID,
+			Cooldowns:   make(map[int]int64),
+			provisional: make(map[int]bool),
+			inflight:    make(map[int]int),
+			weights:     make(map[int]int),
+		}
 		routes[group.ID] = route
 	}
 	items := make(map[int]bool, len(group.Items))

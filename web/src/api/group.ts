@@ -4,8 +4,9 @@ import { apiRequest } from './client';
 import { queryClient } from './client';
 import { groupListQueryOptions } from './queries';
 
-// GroupMode 表示分组的手动, 故障转移或轮询路由模式。
-export type GroupMode = 'manual' | 'failover' | 'round_robin';
+// GroupMode 表示分组的手动, 故障转移, 轮询或加权轮询路由模式。
+// weighted 按成员的并发上限加权分配: 上限越大的成员承接越多请求, 上限同时也是它的硬并发闸门。
+export type GroupMode = 'manual' | 'failover' | 'round_robin' | 'weighted';
 
 // GroupRelayConfig 保存分组 Relay 配置。
 export interface GroupRelayConfig {
@@ -30,6 +31,7 @@ export interface GroupItem {
     key_name: string;
     protocols: number; // 该授权支持的 Protocol 位掩码。
     available: boolean; // 为假表示该成员当前无法转发，但仍会列出以便移除。
+    max_concurrency: number; // 该成员的并发上限，0 表示不限；加权模式下同时是分配权重。
 }
 
 // GroupRuntime 是分组的实时路由状态。
@@ -55,6 +57,7 @@ export interface Group {
 // GroupItemInput 是提交的成员，按渠道授权主键引用；提交顺序即优先级顺序。
 export interface GroupItemInput {
     channel_grant_id: number;
+    max_concurrency?: number; // 并发上限，0 或不传表示不限；加权模式下同时是权重。
 }
 
 // GroupCreateRequest 是创建分组的请求。

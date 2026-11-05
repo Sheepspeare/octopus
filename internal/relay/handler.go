@@ -90,6 +90,9 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 		// 带图请求与流式响应动辄数 MB, 不需要排查时关掉能显著降低内存与磁盘占用;
 		// 关闭后仍登记标记, 使详情显示"未记录"而不是让人误以为内容本身为空。
 		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, string(raw.Body), c.GetInt("api_key_id"))
+		// 选路时占用的成员并发槽位必须归还: 每轮开始前归还上一轮的, 请求退出时归还最后一轮的。
+		// 统一由请求状态持有, 各个 continue/return 分支都不必各自记得释放。
+		defer request.releaseSlot()
 		ctx := request.requestCtx
 		requestStartedAt := time.Now() // 总预算起点, 覆盖全部重试与退避等待。
 		// 失败次数按成员分别累计: 轮询模式下成员会交替, 只记"当前成员"的连续失败会让冷却永远不触发。
@@ -101,6 +104,8 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 		suspects := make(map[int]bool)
 
 		for {
+			// 上一轮的成员槽位到此结束: 先归还再选下一轮, 否则同一请求的重试会一直占着上一个成员的配额。
+			request.releaseSlot()
 			if ctx.Err() != nil {
 				request.markCanceled(ctx.Err(), "", nil)
 				return
@@ -141,6 +146,14 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 					return
 				}
 				continue
+			}
+
+			// 自动模式的选路已为该成员占用一个并发槽位, 登记到请求状态, 由下一轮开始或请求退出时归还。
+			// 手动模式不占槽, 登记 0 以免归还时误减别的请求的计数。
+			if group.Mode == model.GroupModeManual {
+				request.holdSlot(0)
+			} else {
+				request.holdSlot(item.ID)
 			}
 
 			// 成员指向的授权缺失, 凭据被停用或两侧已被删除时等待, 该成员可能很快被改回可用配置。

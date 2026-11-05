@@ -296,3 +296,160 @@ func TestDeterministicCooldownKeepsLargerConfig(t *testing.T) {
 		t.Fatalf("冷却 = %s, 期望 15m", cooldown)
 	}
 }
+
+// newLimitedGroup 构造带并发上限的分组并重置路由状态; limits 与 ids 一一对应, 0 表示不限。
+func newLimitedGroup(t *testing.T, mode model.GroupMode, ids, limits []int) model.Group {
+	t.Helper()
+	ResetRouteState(1)
+	t.Cleanup(func() { ResetRouteState(1) })
+
+	group := testGroup(mode, ids...)
+	for index := range group.Items {
+		group.Items[index].MaxConcurrency = limits[index]
+	}
+	return group
+}
+
+// pickAndRelease 选一次并立即归还槽位, 用于只关心分配比例而不关心占用的用例。
+func pickAndRelease(group model.Group) int {
+	item := pickGroupItem(group, nil)
+	ReleaseItemSlot(group.ID, item.ID)
+	return item.ID
+}
+
+// TestPickWeightedDistributesByConcurrency 验证加权轮询按并发上限的比例分配请求。
+func TestPickWeightedDistributesByConcurrency(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2, 3}, []int{4, 2, 1})
+
+	counts := map[int]int{}
+	for range 70 {
+		id := pickAndRelease(group)
+		if id == 0 {
+			t.Fatalf("全部成员有余量时不应返回零值")
+		}
+		counts[id]++
+	}
+
+	want := map[int]int{1: 40, 2: 20, 3: 10}
+	for id, expected := range want {
+		if counts[id] != expected {
+			t.Fatalf("成员 %d 分到 %d 次, 期望 %d 次 (实际分布 %v)", id, counts[id], expected, counts)
+		}
+	}
+}
+
+// TestPickWeightedUnlimitedSharesMaxWeight 验证未配置上限的成员按组内最大上限参与分配。
+func TestPickWeightedUnlimitedSharesMaxWeight(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{8, 0})
+
+	counts := map[int]int{}
+	for range 20 {
+		counts[pickAndRelease(group)]++
+	}
+	if counts[1] != 10 || counts[2] != 10 {
+		t.Fatalf("不限成员应与最大上限成员等权, 实际分布 %v", counts)
+	}
+}
+
+// TestPickWeightedAllUnlimitedFallsBackToRoundRobin 验证全组都没有上限时退化为等权轮转。
+func TestPickWeightedAllUnlimitedFallsBackToRoundRobin(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{0, 0})
+
+	counts := map[int]int{}
+	for range 10 {
+		counts[pickAndRelease(group)]++
+	}
+	if counts[1] != 5 || counts[2] != 5 {
+		t.Fatalf("等权时应各分一半, 实际分布 %v", counts)
+	}
+}
+
+// TestPickWeightedSkipsFullMember 验证满员的成员不再被选中, 请求转给仍有余量的成员。
+func TestPickWeightedSkipsFullMember(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{1, 0})
+
+	first := pickGroupItem(group, nil)
+	if first.ID == 0 {
+		t.Fatalf("首轮应有成员可选")
+	}
+	// 成员 1 上限为 1, 已占满; 后续请求必须全部落到成员 2。
+	for range 5 {
+		item := pickGroupItem(group, nil)
+		if item.ID != 2 {
+			t.Fatalf("成员 1 满员后应选成员 2, 实际选中 %d", item.ID)
+		}
+		ReleaseItemSlot(group.ID, item.ID)
+	}
+}
+
+// TestPickReturnsZeroWhenAllMembersFull 验证全部成员满员时返回零值, 由调用方等待而不是超发。
+func TestPickReturnsZeroWhenAllMembersFull(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeRoundRobin, []int{1, 2}, []int{1, 1})
+
+	if item := pickGroupItem(group, nil); item.ID == 0 {
+		t.Fatalf("首轮应有成员可选")
+	}
+	if item := pickGroupItem(group, nil); item.ID == 0 {
+		t.Fatalf("第二个成员应还有余量")
+	}
+	if item := pickGroupItem(group, nil); item.ID != 0 {
+		t.Fatalf("全部满员时应返回零值, 实际选中 %d", item.ID)
+	}
+}
+
+// TestReleaseItemSlotReopensCapacity 验证归还槽位后成员重新可选。
+func TestReleaseItemSlotReopensCapacity(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeRoundRobin, []int{1}, []int{1})
+
+	if item := pickGroupItem(group, nil); item.ID != 1 {
+		t.Fatalf("首轮应选中成员 1")
+	}
+	if item := pickGroupItem(group, nil); item.ID != 0 {
+		t.Fatalf("满员时应返回零值")
+	}
+	ReleaseItemSlot(group.ID, 1)
+	if item := pickGroupItem(group, nil); item.ID != 1 {
+		t.Fatalf("归还后应重新可选")
+	}
+}
+
+// TestReleaseItemSlotIgnoresUnusedMember 验证归还未占用的成员不会把计数压到零以下。
+func TestReleaseItemSlotIgnoresUnusedMember(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1}, []int{1})
+
+	ReleaseItemSlot(group.ID, 1)
+	ReleaseItemSlot(group.ID, 1)
+	if item := pickGroupItem(group, nil); item.ID != 1 {
+		t.Fatalf("未占用的归还不应影响可选择性")
+	}
+	if item := pickGroupItem(group, nil); item.ID != 0 {
+		t.Fatalf("上限 1 的成员被占用后应满员, 实际选中 %d", item.ID)
+	}
+}
+
+// TestPickFailoverOverflowsToLowerPriority 验证故障转移在首选成员满员时把请求交给下一优先级。
+func TestPickFailoverOverflowsToLowerPriority(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeFailover, []int{1, 2}, []int{1, 0})
+
+	if item := pickGroupItem(group, nil); item.ID != 1 {
+		t.Fatalf("首选成员应被选中, 实际 %d", item.ID)
+	}
+	if item := pickGroupItem(group, nil); item.ID != 2 {
+		t.Fatalf("首选成员满员后应溢出到成员 2, 实际 %d", item.ID)
+	}
+}
+
+// TestPickWeightedSkipsCoolingMember 验证加权轮询同样跳过冷却中的成员。
+func TestPickWeightedSkipsCoolingMember(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{4, 4})
+	pickAndRelease(group) // 先走一次选路建立路由状态, 冷却表才有地方可写。
+	if !recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 0) {
+		t.Fatalf("成员 2 达到尝试上限后应进入冷却")
+	}
+
+	for range 8 {
+		if id := pickAndRelease(group); id == 2 {
+			t.Fatalf("冷却中的成员不应被选中")
+		}
+	}
+}

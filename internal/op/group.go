@@ -87,7 +87,7 @@ func GroupCreate(req *model.GroupCreateRequest, ctx context.Context) (*model.Gro
 	}
 	model.NormalizeGroupRelayConfig(&group.RelayConfig)
 	for i, item := range req.Items {
-		group.Items[i] = model.GroupItem{ChannelGrantID: item.ChannelGrantID, Priority: i + 1}
+		group.Items[i] = model.GroupItem{ChannelGrantID: item.ChannelGrantID, Priority: i + 1, MaxConcurrency: item.MaxConcurrency}
 	}
 	if err := db.GetDB().WithContext(ctx).Create(&group).Error; err != nil {
 		return nil, err
@@ -186,15 +186,28 @@ func syncGroupItems(tx *gorm.DB, groupID int, requested []model.GroupItemInput) 
 	for priority, requestedItem := range requested {
 		current, ok := existingByGrant[requestedItem.ChannelGrantID]
 		if !ok {
-			newItem := model.GroupItem{GroupID: groupID, ChannelGrantID: requestedItem.ChannelGrantID, Priority: priority + 1}
+			newItem := model.GroupItem{
+				GroupID:        groupID,
+				ChannelGrantID: requestedItem.ChannelGrantID,
+				Priority:       priority + 1,
+				MaxConcurrency: requestedItem.MaxConcurrency,
+			}
 			if err := tx.Create(&newItem).Error; err != nil {
 				return fmt.Errorf("failed to create group item: %w", err)
 			}
 			continue
 		}
+		// 排序与并发上限同属成员配置, 提交值不同即写回; 主键保留, 已有成员的统计与路由状态不受影响。
+		updates := map[string]any{}
 		if current.Priority != priority+1 {
+			updates["priority"] = priority + 1
+		}
+		if current.MaxConcurrency != requestedItem.MaxConcurrency {
+			updates["max_concurrency"] = requestedItem.MaxConcurrency
+		}
+		if len(updates) > 0 {
 			if err := tx.Model(&model.GroupItem{}).Where("id = ?", current.ID).
-				Update("priority", priority+1).Error; err != nil {
+				Updates(updates).Error; err != nil {
 				return fmt.Errorf("failed to update group item: %w", err)
 			}
 		}

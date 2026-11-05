@@ -249,12 +249,16 @@ function SortSection({
     onRemove,
     removingIds,
     onClear,
+    concurrencyEditable,
+    onConcurrencyChange,
 }: {
     members: SelectedMember[];
     onReorder: (members: SelectedMember[]) => void;
     onRemove: (id: string) => void;
     removingIds: Set<string>;
     onClear: () => void;
+    concurrencyEditable: boolean; // 加权模式下成员行直接可编辑并发上限。
+    onConcurrencyChange: (id: string, value: number) => void;
 }) {
     const t = useTranslations('group');
 
@@ -292,6 +296,8 @@ function SortSection({
                     onRemove={onRemove}
                     removingIds={removingIds}
                     showConfirmDelete={false}
+                    concurrencyEditable={concurrencyEditable}
+                    onConcurrencyChange={onConcurrencyChange}
                 />
             </div>
         </div>
@@ -329,6 +335,7 @@ export function GroupEditor({
         channel_name: grant.channel_name,
         key_name: grant.key_name,
         protocols: grant.protocols,
+        max_concurrency: 0, // 新增成员默认不限并发, 需要限流时在成员行上填。
     })), [grantCandidates]);
 
     const [groupName, setGroupName] = useState(initial?.name ?? '');
@@ -385,6 +392,11 @@ export function GroupEditor({
         setRemovingIds(new Set());
     }, []);
 
+    // 并发上限即加权模式的权重: 0 表示不限, 由后端按组内最大上限参与分配。
+    const handleConcurrencyChange = useCallback((id: string, value: number) => {
+        setSelectedMembers((prev) => prev.map((m) => (m.id === id ? { ...m, max_concurrency: value } : m)));
+    }, []);
+
     const isValid = groupKey.length > 0 && selectedMembers.length > 0;
 
     const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -429,6 +441,7 @@ export function GroupEditor({
                                     <SelectItem value="manual">{t('form.manual')}</SelectItem>
                                     <SelectItem value="failover">{t('form.failover')}</SelectItem>
                                     <SelectItem value="round_robin">{t('form.roundRobin')}</SelectItem>
+                                    <SelectItem value="weighted">{t('form.weighted')}</SelectItem>
                                 </SelectContent>
                             </Select>
                         </Field>
@@ -455,6 +468,8 @@ export function GroupEditor({
                                     onRemove={handleRemoveMember}
                                     removingIds={removingIds}
                                     onClear={handleClearMembers}
+                                    concurrencyEditable={mode === 'weighted'}
+                                    onConcurrencyChange={handleConcurrencyChange}
                                 />
                             </div>
                         </TabsContent>

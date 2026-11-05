@@ -72,6 +72,7 @@ export const GroupCard = memo(function GroupCard({ group, now }: { group: Group;
             key_name: item.key_name,
             protocols: item.protocols,
             item_id: item.id,
+            max_concurrency: item.max_concurrency ?? 0,
         })),
         [group.items]
     );
@@ -89,7 +90,10 @@ export const GroupCard = memo(function GroupCard({ group, now }: { group: Group;
     // 成员为整体替换, 拖拽与移除都直接提交当前排列, 优先级由提交顺序决定。
     const submitMembers = useCallback((next: SelectedMember[]) => {
         updateGroup.mutate(
-            { id: group.id, items: next.map((m) => ({ channel_grant_id: m.channel_grant_id })) },
+            {
+                id: group.id,
+                items: next.map((m) => ({ channel_grant_id: m.channel_grant_id, max_concurrency: m.max_concurrency })),
+            },
             { onSuccess, onError },
         );
     }, [group.id, updateGroup, onSuccess, onError]);
@@ -123,8 +127,12 @@ export const GroupCard = memo(function GroupCard({ group, now }: { group: Group;
         // 成员集合与顺序有任一处不同就整体提交; 后端按授权主键匹配, 已有成员保留其主键与统计。
         const nextGrantIDs = values.members.map((m) => m.channel_grant_id);
         const currentGrantIDs = (group.items || []).map((item) => item.channel_grant_id);
-        if (nextGrantIDs.length !== currentGrantIDs.length || nextGrantIDs.some((id, i) => id !== currentGrantIDs[i])) {
-            payload.items = nextGrantIDs.map((channel_grant_id) => ({ channel_grant_id }));
+        const currentLimits = (group.items || []).map((item) => item.max_concurrency ?? 0);
+        const orderChanged = nextGrantIDs.length !== currentGrantIDs.length || nextGrantIDs.some((id, i) => id !== currentGrantIDs[i]);
+        // 并发上限变了同样要整体提交: 后端按授权主键匹配, 只更新变化的成员配置。
+        const limitsChanged = values.members.some((m, i) => m.max_concurrency !== currentLimits[i]);
+        if (orderChanged || limitsChanged) {
+            payload.items = values.members.map((m) => ({ channel_grant_id: m.channel_grant_id, max_concurrency: m.max_concurrency }));
         }
 
         if (Object.keys(payload).length === 1) {
