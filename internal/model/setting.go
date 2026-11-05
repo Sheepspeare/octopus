@@ -15,7 +15,8 @@ const (
 	SettingKeyStatsSaveInterval       SettingKey = "stats_save_interval"        // 将统计信息写入数据库的周期(分钟)
 	SettingKeyModelInfoUpdateInterval SettingKey = "model_info_update_interval" // 模型信息更新间隔(小时)
 	SettingKeyCORSAllowOrigins        SettingKey = "cors_allow_origins"         // 跨域白名单(逗号分隔, 如 "example.com,example2.com"). 为空不允许跨域, "*"允许所有
-	SettingKeyModelFilter             SettingKey = "model_filter"              // 渠道获取模型时的全局过滤表达式; 留空表示不过滤
+	SettingKeyModelFilter             SettingKey = "model_filter"               // 渠道获取模型时的全局过滤表达式; 留空表示不过滤
+	SettingKeyLogRequestBody          SettingKey = "log_request_body"           // 是否记录请求体; 关闭后日志详情不再保存请求原文
 )
 
 type Setting struct {
@@ -30,6 +31,7 @@ func DefaultSettings() []Setting {
 		{Key: SettingKeyCORSAllowOrigins, Value: ""},          // CORS 默认不允许跨域，设置为 "*" 才允许所有来源
 		{Key: SettingKeyModelInfoUpdateInterval, Value: "24"}, // 默认24小时更新一次模型信息
 		{Key: SettingKeyModelFilter, Value: ""},               // 默认不过滤模型
+		{Key: SettingKeyLogRequestBody, Value: "true"},        // 默认记录请求体
 	}
 }
 
@@ -61,6 +63,12 @@ func (s *Setting) Validate() error {
 		// 与渠道侧一致用 ECMAScript 方言校验, 避免设置能存但探测时编译失败。
 		if _, err := regexp2.Compile(s.Value, regexp2.ECMAScript); err != nil {
 			return fmt.Errorf("model filter regex is invalid: %w", err)
+		}
+		return nil
+	case SettingKeyLogRequestBody:
+		// 存成非法布尔会让读取方每次解析失败, 只能退回默认值, 界面上的开关将失去意义。
+		if _, err := strconv.ParseBool(s.Value); err != nil {
+			return fmt.Errorf("log request body must be true or false")
 		}
 		return nil
 	case SettingKeyProxyURL:

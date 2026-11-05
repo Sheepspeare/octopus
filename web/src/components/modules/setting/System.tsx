@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'use-intl';
-import { Monitor, Globe, Clock, Shield, Filter, HelpCircle, X, RotateCw, Loader2, Power } from 'lucide-react';
+import { Monitor, Globe, Clock, Shield, Filter, FileText, HelpCircle, X, RotateCw, Loader2, Power } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import {
     useSettingList,
@@ -26,12 +27,14 @@ export function SettingSystem() {
     const [corsAllowOrigins, setCorsAllowOrigins] = useState('');
     const [corsInputValue, setCorsInputValue] = useState('');
     const [modelFilter, setModelFilter] = useState('');
+    const [logRequestBody, setLogRequestBody] = useState(true);
     const [restarting, setRestarting] = useState(false);
 
     const initialProxyUrl = useRef('');
     const initialStatsSaveInterval = useRef('');
     const initialCorsAllowOrigins = useRef('');
     const initialModelFilter = useRef('');
+    const initialLogRequestBody = useRef(true);
 
     useEffect(() => {
         if (settings) {
@@ -39,6 +42,7 @@ export function SettingSystem() {
             const interval = settings.find(s => s.key === SettingKey.StatsSaveInterval);
             const cors = settings.find(s => s.key === SettingKey.CORSAllowOrigins);
             const modelFilterSetting = settings.find(s => s.key === SettingKey.ModelFilter);
+            const logRequestBodySetting = settings.find(s => s.key === SettingKey.LogRequestBody);
             if (proxy) {
                 queueMicrotask(() => setProxyUrl(proxy.value));
                 initialProxyUrl.current = proxy.value;
@@ -54,6 +58,12 @@ export function SettingSystem() {
             if (modelFilterSetting) {
                 queueMicrotask(() => setModelFilter(modelFilterSetting.value));
                 initialModelFilter.current = modelFilterSetting.value;
+            }
+            if (logRequestBodySetting) {
+                // 未配置时后端默认记录, 这里按同一默认值渲染。
+                const enabled = logRequestBodySetting.value !== 'false';
+                queueMicrotask(() => setLogRequestBody(enabled));
+                initialLogRequestBody.current = enabled;
             }
         }
     }, [settings]);
@@ -129,6 +139,18 @@ export function SettingSystem() {
     const handleRemoveCorsOrigin = (originToRemove: string) => {
         const nextOrigins = corsAllowOriginsList.filter(origin => origin !== originToRemove);
         saveCorsAllowOrigins(nextOrigins);
+    };
+
+    // 记录请求体开关: 立即保存并生效, 只影响之后发起的请求, 已落盘的正文不会被清理。
+    const handleToggleLogRequestBody = (enabled: boolean) => {
+        setLogRequestBody(enabled);
+        if (enabled === initialLogRequestBody.current) return;
+        setSetting.mutate({ key: SettingKey.LogRequestBody, value: String(enabled) }, {
+            onSuccess: () => {
+                initialLogRequestBody.current = enabled;
+                toast.success(t('saved'));
+            },
+        });
     };
 
     // 重启流程: 先不带 force 试一次, 后端有在途请求会回 409, 交给用户确认后再强制。
@@ -284,6 +306,30 @@ export function SettingSystem() {
                         </div>
                     </PopoverContent>
                 </Popover>
+            </div>
+
+            {/* 请求体记录开关 */}
+            <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                    <FileText className="h-5 w-5 text-muted-foreground" />
+                    <div className="flex items-center gap-1.5">
+                        <span className="text-sm font-medium">{t('logRequestBody.label')}</span>
+                        <Tooltip>
+                            <TooltipTrigger asChild>
+                                <HelpCircle className="size-4 text-muted-foreground cursor-help" />
+                            </TooltipTrigger>
+                            <TooltipContent side="top" sideOffset={10} align="center" className="max-w-64">
+                                {t('logRequestBody.hint')}
+                            </TooltipContent>
+                        </Tooltip>
+                    </div>
+                </div>
+                <Switch
+                    checked={logRequestBody}
+                    onCheckedChange={handleToggleLogRequestBody}
+                    disabled={setSetting.isPending}
+                    aria-label={t('logRequestBody.label')}
+                />
             </div>
 
             {/* 重启服务 */}

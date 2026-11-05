@@ -163,6 +163,10 @@
             "placeholder": "请输入过滤表达式",
             "hint": "渠道获取模型时与渠道自身的过滤表达式同时生效（AND），留空不过滤"
         },
+        "logRequestBody": {
+            "label": "记录请求体",
+            "hint": "关闭后日志详情不再保存请求原文，可大幅降低带图请求的日志占用；只影响之后的请求，历史日志不变"
+        },
         "restart": {
             "label": "重启服务",
             "button": "立即重启",
@@ -420,6 +424,7 @@
             "responseContent": "响应内容",
             "images": "图片附件 {count} 张",
             "noRequestContent": "(无请求内容)",
+            "requestBodyOmitted": "请求体未记录：系统设置中已关闭「记录请求体」",
             "noResponseContent": "(无响应内容)",
             "tokens": "词元",
             "retryIndex": "重试 {index}",

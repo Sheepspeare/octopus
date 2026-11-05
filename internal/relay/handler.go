@@ -85,7 +85,15 @@ func Forward(format llm.APIFormat) gin.HandlerFunc {
 		if parsed, parseErr := inbound.TransformRequest(c.Request.Context(), raw); parseErr == nil {
 			reasoningEffort = parsed.ReasoningEffort
 		}
-		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, string(raw.Body), c.GetInt("api_key_id"))
+		// 请求体记录可由设置关闭: 带图请求动辄数 MB, 不需要排查时关掉能显著降低日志占用。
+		// 关闭后仍登记标记, 使详情能显示"未记录"而不是让人误以为请求本身为空。
+		requestBody := string(raw.Body)
+		requestBodyOmitted := false
+		if recordBody, settingErr := op.SettingGetBool(model.SettingKeyLogRequestBody); settingErr == nil && !recordBody {
+			requestBody = ""
+			requestBodyOmitted = true
+		}
+		request := newRequestState(c.Request.Context(), metadata.Model, reasoningEffort, group.ID, requestProtocol, requestBody, requestBodyOmitted, c.GetInt("api_key_id"))
 		ctx := request.requestCtx
 		requestStartedAt := time.Now() // 总预算起点, 覆盖全部重试与退避等待。
 		failedItemID := 0              // 当前累计连续失败次数的成员 ID。

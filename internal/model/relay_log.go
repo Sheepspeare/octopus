@@ -32,5 +32,6 @@ type RelayLog struct {
 	ResponseBodyPath   string        `json:"-"`                                        // 响应体文件相对日志根目录的路径, 为空表示未留存。
 	RequestBodyBytes   int64         `json:"request_bytes"`                            // 请求体字节数, 便于界面标注体积。
 	ResponseBodyBytes  int64         `json:"response_bytes"`                           // 响应体字节数。
+	RequestBodyOmitted bool          `json:"request_body_omitted"`                     // 请求体因设置关闭而未记录; 与"内容为空"区分, 重启后仍然成立。
 	CreatedAt          time.Time     `json:"created_at" gorm:"index"`                  // 落库时间, 清理按它计算保留期。
 }

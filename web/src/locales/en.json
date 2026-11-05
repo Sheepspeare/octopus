@@ -163,6 +163,10 @@
             "placeholder": "Enter filter regex",
             "hint": "Applied along with the channel's own filter when fetching models (AND); empty means no filter"
         },
+        "logRequestBody": {
+            "label": "Record request body",
+            "hint": "When off, request bodies are no longer stored with logs, which greatly reduces log size for image requests. Only affects new requests; existing logs stay unchanged"
+        },
         "restart": {
             "label": "Restart service",
             "button": "Restart now",
@@ -420,6 +424,7 @@
             "responseContent": "Response Content",
             "images": "Image attachments: {count}",
             "noRequestContent": "(No request content)",
+            "requestBodyOmitted": "Request body not recorded: \"Record request body\" is turned off in settings",
             "noResponseContent": "(No response content)",
             "tokens": "tokens",
             "retryIndex": "Retry {index}",

@@ -40,6 +40,7 @@ export interface RelayLogOverview {
     target_protocol: number;
     sending: boolean;
     error?: string;
+    request_body_omitted?: boolean; // 请求体因设置关闭而未记录, 用于区分"未记录"与"内容为空"。
 }
 
 // useClearLogs 清空已完成的内存日志。

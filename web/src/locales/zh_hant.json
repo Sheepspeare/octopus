@@ -163,6 +163,10 @@
             "placeholder": "請輸入過濾表達式",
             "hint": "渠道獲取模型時與渠道自身的過濾表達式同時生效（AND），留空不過濾"
         },
+        "logRequestBody": {
+            "label": "記錄請求體",
+            "hint": "關閉後日誌詳情不再保存請求原文，可大幅降低帶圖請求的日誌佔用；只影響之後的請求，歷史日誌不變"
+        },
         "restart": {
             "label": "重啟服務",
             "button": "立即重啟",
@@ -420,6 +424,7 @@
             "responseContent": "回應內容",
             "images": "圖片附件 {count} 張",
             "noRequestContent": "(無請求內容)",
+            "requestBodyOmitted": "請求體未記錄：系統設定中已關閉「記錄請求體」",
             "noResponseContent": "(無回應內容)",
             "tokens": "詞元",
             "retryIndex": "重試 {index}",

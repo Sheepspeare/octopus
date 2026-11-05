@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useState, type CSSProperties } from 'react';
-import { AlertCircle, ArrowDownToLine, ArrowRight, ArrowUpFromLine, Brain, Clock, Cpu, Database, DollarSign, Gauge, ImageIcon, KeyRound, Loader2, Square, X, Zap, Percent } from 'lucide-react';
+import { AlertCircle, ArrowDownToLine, ArrowRight, ArrowUpFromLine, Brain, Clock, Cpu, Database, DollarSign, EyeOff, Gauge, ImageIcon, KeyRound, Loader2, Square, X, Zap, Percent } from 'lucide-react';
 import { useTranslations } from 'use-intl';
 import JsonView from '@uiw/react-json-view';
 import { githubDarkTheme } from '@uiw/react-json-view/githubDark';
@@ -17,13 +17,11 @@ import { toast } from 'sonner';
 import { MemberStatus } from '@/components/modules/group/MemberStatus';
 import {
     MorphingDialog,
-    MorphingDialogTrigger,
     MorphingDialogContainer,
     MorphingDialogContent,
     MorphingDialogClose,
     MorphingDialogTitle,
     MorphingDialogDescription,
-    useMorphingDialog,
 } from '@/components/ui/morphing-dialog';
 
 // formatTime 将后端 RFC3339 时间转换为本地时分秒。
@@ -258,15 +256,23 @@ function JsonContent({ content, fallbackText }: { content: string | object | und
 }
 
 // LogDetail 渲染日志详情弹窗内容, 仅在弹窗打开期间挂载, 由此避免列表中的卡片持有详情查询和状态。
-function LogDetail({ log, now, errorRounds }: { log: RelayLogOverview; now: number; errorRounds: ObservedRound[] }) {
+function LogDetail({ log }: { log: RelayLogOverview }) {
     const t = useTranslations('log.card');
     const statusT = useTranslations('log.status');
     const [leftTab, setLeftTab] = useState<'request' | 'group'>('group');
-    const [rounds, setRounds] = useState<ObservedRound[]>(errorRounds);
+    // 打开时若已有错误, 直接把当前轮次作为第一条记录, 让重试详情不用等下一次推送。
+    const [rounds, setRounds] = useState<ObservedRound[]>(() => log.error ? [{
+        round: log.round,
+        channelKey: log.target_channel_key,
+        error: log.error,
+        sending: log.sending,
+        startedAt: log.round_started_at,
+    }] : []);
     const [observedRoundKey, setObservedRoundKey] = useState(''); // observedRoundKey 是已记入 rounds 的最近一次日志快照, 用于跳过重复渲染。
     const [detailReady, setDetailReady] = useState(false); // 展开动画结束后才允许加载详情数据。
     const [switchingItemId, setSwitchingItemId] = useState<number | null>(null);
-    const requestBody = useLogRequestBody(log.id, log.started_at, detailReady && leftTab === 'request');
+    const [now, setNow] = useState(() => Date.now()); // 成员状态与进行中耗时都要随时钟走动。
+    const requestBody = useLogRequestBody(log.id, log.started_at, detailReady && leftTab === 'request' && !log.request_body_omitted);
     const responseBody = useLogResponseBody(log.id, log.started_at, detailReady && log.status === 'success');
     const { data: activeGroup } = useGroup(log.group_id, detailReady, detailReady);
     const updateActiveItem = useUpdateGroup();
@@ -284,6 +290,12 @@ function LogDetail({ log, now, errorRounds }: { log: RelayLogOverview; now: numb
     useEffect(() => {
         const timer = window.setTimeout(() => setDetailReady(true), 600);
         return () => window.clearTimeout(timer);
+    }, []);
+
+    // 弹窗打开期间按时钟刷新: 进行中的耗时、成员冷却倒计时都需要这个基准。
+    useEffect(() => {
+        const timer = window.setInterval(() => setNow(Date.now()), 500);
+        return () => window.clearInterval(timer);
     }, []);
 
     // 按轮次记录本次打开期间观察到的上游请求状态, 最新一轮排在最前。
@@ -366,7 +378,12 @@ function LogDetail({ log, now, errorRounds }: { log: RelayLogOverview; now: numb
                                     <Loader2 className="size-5 animate-spin text-muted-foreground" />
                                 </div>
                             ) : leftTab === 'request' ? (
-                                requestBody.isLoading ? (
+                                log.request_body_omitted ? (
+                                    <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-xs text-muted-foreground">
+                                        <EyeOff className="size-5" />
+                                        <span>{t('requestBodyOmitted')}</span>
+                                    </div>
+                                ) : requestBody.isLoading ? (
                                     <div className="flex h-full items-center justify-center">
                                         <Loader2 className="size-5 animate-spin text-muted-foreground" />
                                     </div>
@@ -559,31 +576,24 @@ function LogDetail({ log, now, errorRounds }: { log: RelayLogOverview; now: numb
     );
 }
 
-// LogCardBody 渲染日志概览卡片, 并在弹窗打开时挂载详情面板。
-function LogCardBody({ log }: { log: RelayLogOverview }) {
+// LogCard 渲染一条日志概览; 点击时把这条记录交给列表层打开详情。
+// 弹窗状态不放在卡片里: 列表是虚拟列表, 卡片会被回收, 弹窗跟着卡片卸载就会自己消失。
+export const LogCard = memo(function LogCard({ log, onOpen }: { log: RelayLogOverview; onOpen: (log: RelayLogOverview) => void }) {
     const t = useTranslations('log.card');
-    const { isOpen } = useMorphingDialog();
     const [now, setNow] = useState(() => Date.now());
     const [displayError, setDisplayError] = useState(log.error ?? ''); // 保留重试期间最近一次错误, 直到响应真正开始。
-    const [errorRounds, setErrorRounds] = useState<ObservedRound[]>(() => log.error ? [{
-        round: log.round,
-        channelKey: log.target_channel_key,
-        error: log.error,
-        sending: log.sending,
-        startedAt: log.round_started_at,
-    }] : []); // 在概览卡片存留期间收集最近五次错误, 供详情打开时直接展示。
     const actualModel = log.target_model || log.model;
     const { Icon, className: iconClassName, color: brandColor } = getModelIcon(actualModel);
     const requestRunning = log.status === 'running' || log.status === 'committed';
     const errorText = log.error ?? '';
     const visibleError = log.status === 'committed' || log.status === 'success' ? '' : displayError;
 
-    // 仅在请求进行中或弹窗打开时按 500ms 刷新, 避免已完成日志持续触发重渲染。
+    // 仅在请求进行中按 500ms 刷新, 避免已完成日志持续触发重渲染。
     useEffect(() => {
-        if (!requestRunning && !isOpen) return;
+        if (!requestRunning) return;
         const timer = window.setInterval(() => setNow(Date.now()), 500);
         return () => window.clearInterval(timer);
-    }, [isOpen, requestRunning]);
+    }, [requestRunning]);
 
     // 新错误覆盖旧错误; 响应已开始或请求成功后清除错误提示。
     useEffect(() => {
@@ -594,82 +604,85 @@ function LogCardBody({ log }: { log: RelayLogOverview }) {
         }
     }, [errorText, log.status]);
 
-    useEffect(() => {
-        if (!errorText) return;
-        setErrorRounds((current) => [
-            {
-                round: log.round,
-                channelKey: log.target_channel_key,
-                error: errorText,
-                sending: log.sending,
-                startedAt: log.round_started_at,
-            },
-            ...current.filter((round) => round.round !== log.round),
-        ].slice(0, 5));
-    }, [errorText, log.round, log.target_channel_key, log.sending, log.round_started_at]);
-
     return (
-        <>
-            <MorphingDialogTrigger
-                className="rounded-3xl border border-border bg-card w-full text-left"
-            >
-                <div className="p-4 grid grid-cols-[auto_1fr] gap-4 items-start">
-                    <Icon aria-hidden="true" className={cn('hidden md:block', iconClassName)} width={40} height={40} />
-                    <div className="min-w-0 flex flex-col gap-3 col-span-2 md:col-span-1">
-                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0 text-sm">
-                            <span className="flex w-full min-w-0 items-center gap-2 md:w-auto">
-                                <span className="shrink-0 text-xs text-muted-foreground/70"><span className="md:hidden">{PROTOCOL_LABELS[log.protocol]?.charAt(0) ?? '-'}</span><span className="hidden md:inline">{PROTOCOL_LABELS[log.protocol] ?? '-'}</span></span>
-                                <span className="font-semibold text-card-foreground truncate">
-                                    {log.model || t('unknownModel')}
-                                </span>
-                                {log.reasoning_effort && (
-                                    <Badge variant="secondary" className="max-w-32 bg-violet-500/10 px-1.5 py-0 text-xs text-violet-700 dark:text-violet-300">
-                                        <Brain aria-hidden="true" />
-                                        <span className="truncate">{log.reasoning_effort}</span>
-                                    </Badge>
-                                )}
-                                {requestRunning
-                                    ? <Loader2 className={cn('size-3.5 shrink-0 animate-spin', log.status === 'committed' ? 'text-green-500' : log.round > 1 ? 'text-red-500' : 'text-muted-foreground/50')} />
-                                    : <ArrowRight className="size-3.5 shrink-0 text-muted-foreground/50" />}
+        <div
+            role="button"
+            tabIndex={0}
+            onClick={() => onOpen(log)}
+            onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    onOpen(log);
+                }
+            }}
+            aria-haspopup="dialog"
+            className="rounded-3xl border border-border bg-card w-full text-left cursor-pointer transition-colors hover:border-foreground/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+            <div className="p-4 grid grid-cols-[auto_1fr] gap-4 items-start">
+                <Icon aria-hidden="true" className={cn('hidden md:block', iconClassName)} width={40} height={40} />
+                <div className="min-w-0 flex flex-col gap-3 col-span-2 md:col-span-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0 text-sm">
+                        <span className="flex w-full min-w-0 items-center gap-2 md:w-auto">
+                            <span className="shrink-0 text-xs text-muted-foreground/70"><span className="md:hidden">{PROTOCOL_LABELS[log.protocol]?.charAt(0) ?? '-'}</span><span className="hidden md:inline">{PROTOCOL_LABELS[log.protocol] ?? '-'}</span></span>
+                            <span className="font-semibold text-card-foreground truncate">
+                                {log.model || t('unknownModel')}
                             </span>
-                            <span className="flex w-full min-w-0 items-center gap-2 md:w-auto">
-                                <span className="shrink-0 text-xs text-muted-foreground/70"><span className="md:hidden">{PROTOCOL_LABELS[log.target_protocol]?.charAt(0) ?? '-'}</span><span className="hidden md:inline">{PROTOCOL_LABELS[log.target_protocol] ?? '-'}</span></span>
-                                <Badge
-                                    variant="secondary"
-                                    className="shrink-0 text-xs px-1.5 py-0"
-                                    style={{ backgroundColor: `${brandColor}15`, color: brandColor }}
-                                >
-                                    {log.target_channel_key || '-'}
+                            {log.reasoning_effort && (
+                                <Badge variant="secondary" className="max-w-32 bg-violet-500/10 px-1.5 py-0 text-xs text-violet-700 dark:text-violet-300">
+                                    <Brain aria-hidden="true" />
+                                    <span className="truncate">{log.reasoning_effort}</span>
                                 </Badge>
-                                <span className="text-muted-foreground truncate">
-                                    {actualModel}
-                                </span>
+                            )}
+                            {requestRunning
+                                ? <Loader2 className={cn('size-3.5 shrink-0 animate-spin', log.status === 'committed' ? 'text-green-500' : log.round > 1 ? 'text-red-500' : 'text-muted-foreground/50')} />
+                                : <ArrowRight className="size-3.5 shrink-0 text-muted-foreground/50" />}
+                        </span>
+                        <span className="flex w-full min-w-0 items-center gap-2 md:w-auto">
+                            <span className="shrink-0 text-xs text-muted-foreground/70"><span className="md:hidden">{PROTOCOL_LABELS[log.target_protocol]?.charAt(0) ?? '-'}</span><span className="hidden md:inline">{PROTOCOL_LABELS[log.target_protocol] ?? '-'}</span></span>
+                            <Badge
+                                variant="secondary"
+                                className="shrink-0 text-xs px-1.5 py-0"
+                                style={{ backgroundColor: `${brandColor}15`, color: brandColor }}
+                            >
+                                {log.target_channel_key || '-'}
+                            </Badge>
+                            <span className="text-muted-foreground truncate">
+                                {actualModel}
                             </span>
-                        </div>
-                        <div className="grid grid-cols-20 gap-x-4 gap-y-2 text-xs tabular-nums text-muted-foreground md:grid-cols-11">
-                            <LogMetrics log={log} now={now} brandColor={brandColor} variant="card" />
-                        </div>
-                        {visibleError && (
-                            <div className="p-2.5 rounded-xl bg-destructive/10 border border-destructive/20 overflow-hidden">
-                                <p className="text-xs text-destructive line-clamp-1 whitespace-pre-line">{log.status === 'running' ? `${t('retryIndex', { index: log.round })}: ` : ''}{visibleError}</p>
-                            </div>
-                        )}
+                        </span>
                     </div>
+                    <div className="grid grid-cols-20 gap-x-4 gap-y-2 text-xs tabular-nums text-muted-foreground md:grid-cols-11">
+                        <LogMetrics log={log} now={now} brandColor={brandColor} variant="card" />
+                    </div>
+                    {visibleError && (
+                        <div className="p-2.5 rounded-xl bg-destructive/10 border border-destructive/20 overflow-hidden">
+                            <p className="text-xs text-destructive line-clamp-1 whitespace-pre-line">{log.status === 'running' ? `${t('retryIndex', { index: log.round })}: ` : ''}{visibleError}</p>
+                        </div>
+                    )}
                 </div>
-            </MorphingDialogTrigger>
-
-            <MorphingDialogContainer>
-                <LogDetail log={log} now={now} errorRounds={errorRounds} />
-            </MorphingDialogContainer>
-        </>
-    );
-}
-
-// LogCard 展示一条日志概览, 并在弹窗打开时加载详情。
-export const LogCard = memo(function LogCard({ log }: { log: RelayLogOverview }) {
-    return (
-        <MorphingDialog>
-            <LogCardBody log={log} />
-        </MorphingDialog>
+            </div>
+        </div>
     );
 });
+
+// LogDetailDialog 在列表层承载详情弹窗: 打开状态由列表持有, 卡片被虚拟列表回收时弹窗照常保留。
+export function LogDetailDialog({ log, onClose }: { log: RelayLogOverview | null; onClose: () => void }) {
+    // 关闭时保留最后一次内容, 让退出动画有内容可播; 打开另一条记录时立即替换。
+    const [shown, setShown] = useState<RelayLogOverview | null>(log);
+    useEffect(() => {
+        if (log) setShown(log);
+    }, [log]);
+
+    return (
+        <MorphingDialog
+            open={log !== null}
+            onOpenChange={(open) => {
+                if (!open) onClose();
+            }}
+        >
+            <MorphingDialogContainer>
+                {shown && <LogDetail key={shown.id} log={shown} />}
+            </MorphingDialogContainer>
+        </MorphingDialog>
+    );
+}

@@ -53,7 +53,9 @@ func buildOutbound(channel model.Channel, grant model.ChannelGrant, channelKey m
 // clientHeaderPlaceholder 匹配自定义 Header 值中引用的客户端请求头
 var clientHeaderPlaceholder = regexp.MustCompile(`\{client_header:[^}]+\}`)
 
-// applyChannelConfig 按渠道配置覆盖上游请求的参数并追加自定义 Header; model 与 stream 由转发流程决定, 不允许覆盖。
+// applyChannelConfig 为上游请求补充渠道配置的默认参数并追加自定义 Header; model 与 stream 由转发流程决定, 不允许覆盖。
+// 参数按缺省值语义处理: 客户端已经显式提供同名字段时保留客户端值, 只有客户端没传才填入渠道配置,
+// 由此渠道配置只决定"没指定时用什么", 不会悄悄改掉调用方明确要求的参数。
 func applyChannelConfig(channel model.Channel, request *httpclient.Request) error {
 	if channel.ParamOverride != "" {
 		var overrides map[string]json.RawMessage
@@ -63,8 +65,16 @@ func applyChannelConfig(channel model.Channel, request *httpclient.Request) erro
 		body := request.Body
 		// 覆盖键可能自带点号或冒号, 转义后再作为 sjson 路径使用, 避免被解析成嵌套路径。
 		escape := strings.NewReplacer("\\", "\\\\", ".", "\\.", ":", "\\:")
+		// 是否已存在按顶层键名判断: 键名可能含点号等字符, 用路径探测容易把 "a.b" 误判成嵌套路径。
+		// 请求体不是 JSON 对象时 present 为空, 与原先一样按覆盖值写入。
+		var present map[string]json.RawMessage
+		_ = json.Unmarshal(body, &present)
 		for key, value := range overrides {
 			if key == "model" || key == "stream" {
+				continue
+			}
+			// 客户端已显式提供该字段(含显式 null)时不做任何改动, 保证调用方参数优先。
+			if _, ok := present[key]; ok {
 				continue
 			}
 			next, err := sjson.SetRawBytes(body, ":"+escape.Replace(key), value)

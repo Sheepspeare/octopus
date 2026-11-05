@@ -42,18 +42,18 @@ type RequestState struct {
 	Cost               float64        `json:"cost"`                 // 请求结束时写入的累计费用。
 	OutputChars        int            `json:"output_chars"`         // 流式过程中按事件数量估算并实时累计的输出字符数, 仅用于界面展示, 不参与结算。
 
-	Round            int            `json:"round"`              // 最新一轮循环的递增序号, 人工中止按此匹配以免误杀下一轮。
-	RoundStartedAt   time.Time      `json:"round_started_at"`   // 最新一轮上游请求的开始时间。
-	TargetChannelKey string         `json:"target_channel_key"` // 最新一轮选中的渠道名称和 Key 名称, 以空格分隔。
-	TargetModel      string         `json:"target_model"`       // 最新一轮实际请求上游的模型名称。
-	TargetProtocol   model.Protocol `json:"target_protocol"`    // 最新一轮实际请求上游的协议, 与 Protocol 不同即本轮做了跨协议转换; 0 表示尚未选出。
-	Sending          bool           `json:"sending"`            // 最新一轮是否仍在等待上游响应。
-	Error            string         `json:"error,omitempty"`    // 最新一轮的失败原因, 请求结束后即为最终错误。
+	Round              int            `json:"round"`                          // 最新一轮循环的递增序号, 人工中止按此匹配以免误杀下一轮。
+	RoundStartedAt     time.Time      `json:"round_started_at"`               // 最新一轮上游请求的开始时间。
+	TargetChannelKey   string         `json:"target_channel_key"`             // 最新一轮选中的渠道名称和 Key 名称, 以空格分隔。
+	TargetModel        string         `json:"target_model"`                   // 最新一轮实际请求上游的模型名称。
+	TargetProtocol     model.Protocol `json:"target_protocol"`                // 最新一轮实际请求上游的协议, 与 Protocol 不同即本轮做了跨协议转换; 0 表示尚未选出。
+	Sending            bool           `json:"sending"`                        // 最新一轮是否仍在等待上游响应。
+	Error              string         `json:"error,omitempty"`                // 最新一轮的失败原因, 请求结束后即为最终错误。
+	RequestBodyOmitted bool           `json:"request_body_omitted,omitempty"` // 请求体因设置关闭而未记录, 供界面区分"未记录"与"内容为空"。
 
-	requestBody  string // 客户端原始请求体, 体积大故不进状态流, 由独立接口按需拉取。
-	responseBody string // 聚合后的完整最终响应体, 同样按需拉取。
-	apiKeyID     int    // 发起请求的 API Key ID, 用于请求完成后的归属统计。
-
+	requestBody   string             // 客户端原始请求体, 体积大故不进状态流, 由独立接口按需拉取。
+	responseBody  string             // 聚合后的完整最终响应体, 同样按需拉取。
+	apiKeyID      int                // 发起请求的 API Key ID, 用于请求完成后的归属统计。
 	requestCtx    context.Context    // 请求级上下文, 同时约束等待、当前轮次和后续重试。
 	requestCancel context.CancelFunc // 中止整个请求, 同时打断等待、当前轮次和后续重试。
 	roundCancel   context.CancelFunc // 中止最新一轮上游请求, 仅在该轮等待响应期间非空。
@@ -92,23 +92,25 @@ func capBody(body string) string {
 }
 
 // newRequestState 分配请求 ID 并登记初始运行状态; 返回的记录是本请求后续全部状态写入的入口。
-func newRequestState(ctx context.Context, modelName, reasoningEffort string, groupID int, protocol model.Protocol, body string, apiKeyID int) *RequestState {
+// bodyOmitted 为真表示调用方按设置关闭了请求体记录, 此时 body 为空且界面应展示"未记录"而非"无内容"。
+func newRequestState(ctx context.Context, modelName, reasoningEffort string, groupID int, protocol model.Protocol, body string, bodyOmitted bool, apiKeyID int) *RequestState {
 	requestCtx, requestCancel := context.WithCancel(ctx)
 	mu.Lock()
 	defer mu.Unlock()
 
 	request := &RequestState{
-		ID:              idSeq.Add(1),
-		Status:          StatusRunning,
-		StartedAt:       time.Now(),
-		Model:           modelName,
-		ReasoningEffort: reasoningEffort,
-		Protocol:        protocol,
-		GroupID:         groupID,
-		requestBody:     capBody(body),
-		apiKeyID:        apiKeyID,
-		requestCtx:      requestCtx,
-		requestCancel:   requestCancel,
+		ID:                 idSeq.Add(1),
+		Status:             StatusRunning,
+		StartedAt:          time.Now(),
+		Model:              modelName,
+		ReasoningEffort:    reasoningEffort,
+		Protocol:           protocol,
+		GroupID:            groupID,
+		RequestBodyOmitted: bodyOmitted,
+		requestBody:        capBody(body),
+		apiKeyID:           apiKeyID,
+		requestCtx:         requestCtx,
+		requestCancel:      requestCancel,
 	}
 	// 登记时保存名称快照, 查询失败时留空。
 	if apiKey, err := op.APIKeyGet(apiKeyID, ctx); err == nil {
@@ -353,6 +355,7 @@ func recordOf(request *RequestState) model.RelayLog {
 		TargetModel:        request.TargetModel,
 		TargetProtocol:     uint8(request.TargetProtocol),
 		Error:              request.Error,
+		RequestBodyOmitted: request.RequestBodyOmitted,
 	}
 }
 

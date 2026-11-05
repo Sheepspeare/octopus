@@ -1,10 +1,10 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Loader2, Logs } from 'lucide-react';
 import { useTranslations } from 'use-intl';
 import { useLogHistory, useLogs, type RelayLogOverview } from '@/api/log';
 import { VirtualizedGrid } from '@/components/common/VirtualizedGrid';
 import { Button } from '@/components/ui/button';
-import { LogCard } from './Item';
+import { LogCard, LogDetailDialog } from './Item';
 
 // Log 展示进程内日志概览，并按 RequestID 实时更新卡片。
 // 状态流只推内存里的最近若干条，更早的历史按需从库里翻页取，两段按 ID 合并后统一渲染。
@@ -12,6 +12,8 @@ export function Log() {
     const t = useTranslations('log');
     const { logs, isLoading, error } = useLogs();
     const { older, load, isLoading: isLoadingOlder, exhausted } = useLogHistory();
+    // 详情弹窗的打开状态由列表持有, 不放在卡片里: 虚拟列表会回收卡片, 卡片一卸载弹窗就跟着消失。
+    const [openLog, setOpenLog] = useState<RelayLogOverview | null>(null);
 
     const merged = useMemo(() => {
         const byId = new Map<number, RelayLogOverview>();
@@ -20,6 +22,12 @@ export function Log() {
         for (const item of logs) byId.set(item.id, item);
         return [...byId.values()].sort((a, b) => b.id - a.id);
     }, [logs, older]);
+
+    // 打开中的记录跟随列表刷新, 让详情里的状态继续更新; 记录已被内存淘汰时退回打开时的快照, 弹窗不会因此关闭。
+    const activeLog = useMemo(
+        () => (openLog ? merged.find((item) => item.id === openLog.id) ?? openLog : null),
+        [merged, openLog]
+    );
 
     if (isLoading) {
         return (
@@ -53,7 +61,7 @@ export function Log() {
                     estimateItemHeight={104}
                     overscan={8}
                     getItemKey={(log) => `log-${log.id}`}
-                    renderItem={(log) => <LogCard log={log} />}
+                    renderItem={(log) => <LogCard log={log} onOpen={setOpenLog} />}
                 />
             </div>
             {!exhausted && (
@@ -69,6 +77,7 @@ export function Log() {
                     </Button>
                 </div>
             )}
+            <LogDetailDialog log={activeLog} onClose={() => setOpenLog(null)} />
         </div>
     );
 }

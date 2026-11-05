@@ -325,12 +325,13 @@ func recordToState(record model.RelayLog) *RequestState {
 			CompletionTokens: record.CompletionTokens,
 			TotalTokens:      record.TotalTokens,
 		},
-		Cost:             record.Cost,
-		Round:            record.Round,
-		TargetChannelKey: record.TargetChannelKey,
-		TargetModel:      record.TargetModel,
-		TargetProtocol:   model.Protocol(record.TargetProtocol),
-		Error:            record.Error,
+		Cost:               record.Cost,
+		Round:              record.Round,
+		TargetChannelKey:   record.TargetChannelKey,
+		TargetModel:        record.TargetModel,
+		TargetProtocol:     model.Protocol(record.TargetProtocol),
+		Error:              record.Error,
+		RequestBodyOmitted: record.RequestBodyOmitted,
 	}
 }
 

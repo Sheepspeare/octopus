@@ -42,13 +42,31 @@ function useMorphingDialog() {
 export type MorphingDialogProviderProps = {
   children: React.ReactNode;
   transition?: Transition;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 };
 
 function MorphingDialogProvider({
   children,
   transition,
+  open: controlledOpen,
+  onOpenChange,
 }: MorphingDialogProviderProps) {
-  const [isOpen, setIsOpen] = useState(false);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  // 传入 open 即切换为受控模式: 开关状态由调用方持有, 用于弹窗必须活得比触发卡片更久的场景
+  // (例如虚拟列表回收卡片)。不传则维持原来的内部状态, 现有调用方行为不变。
+  const isControlled = controlledOpen !== undefined;
+  const isOpen = isControlled ? controlledOpen : uncontrolledOpen;
+
+  const setIsOpen = useCallback<React.Dispatch<React.SetStateAction<boolean>>>(
+    (value) => {
+      const next = typeof value === 'function' ? value(isOpen) : value;
+      if (!isControlled) setUncontrolledOpen(next);
+      onOpenChange?.(next);
+    },
+    [isControlled, isOpen, onOpenChange]
+  );
+
   const uniqueId = useId();
   const triggerRef = useRef<HTMLDivElement>(null!);
 
@@ -59,7 +77,7 @@ function MorphingDialogProvider({
       uniqueId,
       triggerRef,
     }),
-    [isOpen, uniqueId]
+    [isOpen, setIsOpen, uniqueId]
   );
 
   return (
@@ -72,11 +90,22 @@ function MorphingDialogProvider({
 export type MorphingDialogProps = {
   children: React.ReactNode;
   transition?: Transition;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 };
 
-function MorphingDialog({ children, transition }: MorphingDialogProps) {
+function MorphingDialog({
+  children,
+  transition,
+  open,
+  onOpenChange,
+}: MorphingDialogProps) {
   return (
-    <MorphingDialogProvider>
+    <MorphingDialogProvider
+      transition={transition}
+      open={open}
+      onOpenChange={onOpenChange}
+    >
       <MotionConfig transition={transition}>{children}</MotionConfig>
     </MorphingDialogProvider>
   );
@@ -210,6 +239,10 @@ function MorphingDialogContent({
       document.body.classList.remove('overflow-hidden');
       triggerRef.current?.focus();
     }
+    // 卸载时也要解锁: 弹窗内容若在打开状态下被直接移除(例如外层列表重建), 页面会永久失去滚动。
+    return () => {
+      document.body.classList.remove('overflow-hidden');
+    };
   }, [isOpen, triggerRef]);
 
   useClickOutside(
