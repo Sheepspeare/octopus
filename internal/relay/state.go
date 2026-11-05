@@ -434,7 +434,7 @@ func CloseRequestStream(stream chan RequestState) {
 
 // RequestBody 返回指定请求的原始请求体; 内存里没有则按落盘路径读回。
 // 查询不能持锁进行: 读库与读文件都比内存慢, 持锁会连带阻塞状态流的推送。
-func RequestBody(id uint64) string {
+func RequestBody(id uint64) (string, bool) {
 	mu.Lock()
 	request := requests[id]
 	body := ""
@@ -444,13 +444,13 @@ func RequestBody(id uint64) string {
 	mu.Unlock()
 
 	if body != "" {
-		return body
+		return body, true
 	}
 	return readPersistedBody(id, false)
 }
 
 // ResponseBody 返回指定请求保存的响应体; 内存里没有则按落盘路径读回。
-func ResponseBody(id uint64) string {
+func ResponseBody(id uint64) (string, bool) {
 	mu.Lock()
 	request := requests[id]
 	body := ""
@@ -460,7 +460,7 @@ func ResponseBody(id uint64) string {
 	mu.Unlock()
 
 	if body != "" {
-		return body
+		return body, true
 	}
 	return readPersistedBody(id, true)
 }

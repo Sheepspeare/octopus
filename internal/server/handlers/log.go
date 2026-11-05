@@ -106,23 +106,34 @@ func listLogs(c *gin.Context) {
 }
 
 // getRequestBody 返回指定请求的原始请求体。
+// getRequestBody 返回指定请求的请求体; 记录不存在时返回 404, 便于前端区分"暂无"与"为空"。
 func getRequestBody(c *gin.Context) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
 	if err != nil {
 		resp.Error(c, http.StatusBadRequest, "invalid request id")
 		return
 	}
-	resp.Success(c, relay.RequestBody(id))
+	body, ok := relay.RequestBody(id)
+	if !ok {
+		resp.Error(c, http.StatusNotFound, "request body not available")
+		return
+	}
+	resp.Success(c, body)
 }
 
-// getResponseBody 返回指定请求当前保存的响应体。
+// getResponseBody 返回指定请求当前保存的响应体; 记录不存在时返回 404。
 func getResponseBody(c *gin.Context) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
 	if err != nil {
 		resp.Error(c, http.StatusBadRequest, "invalid request id")
 		return
 	}
-	resp.Success(c, relay.ResponseBody(id))
+	body, ok := relay.ResponseBody(id)
+	if !ok {
+		resp.Error(c, http.StatusNotFound, "response body not available")
+		return
+	}
+	resp.Success(c, body)
 }
 
 // streamOverview 逐条发送建立连接时的概览及后续请求更新。

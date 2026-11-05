@@ -29,6 +29,70 @@ const (
 // logRoot 是正文文件的根目录, 由 InitStore 写入。
 var logRoot string
 
+// maxBodyCacheBytes 是未落盘正文的缓存上限; 数据库持续写失败时整体丢弃, 避免无界增长。
+const maxBodyCacheBytes = int64(256) << 20
+
+// bodyCache 保留尚未写入磁盘的正文。
+// 记录在 finishLocked 里就把正文交给了写盘协程, 批量写盘默认要等 30 秒,
+// 这段时间数据库里还没有该记录, 只读文件会得到空串。缓存补齐这段窗口,
+// 使日志详情从请求结束那一刻起就能读到内容; 条目在 persistBatch 成功后删除。
+var (
+	bodyCacheMu    sync.Mutex
+	bodyCache      = make(map[uint64][2]string) // 主键对应 {请求体, 响应体}。
+	bodyCacheBytes int64
+)
+
+// cacheBody 登记一条待落盘的正文; 超过上限时整体丢弃, 退回按文件读取。
+func cacheBody(id uint64, requestBody, responseBody string) {
+	size := int64(len(requestBody) + len(responseBody))
+	bodyCacheMu.Lock()
+	defer bodyCacheMu.Unlock()
+	if bodyCacheBytes+size > maxBodyCacheBytes {
+		bodyCache = make(map[uint64][2]string)
+		bodyCacheBytes = 0
+		return
+	}
+	bodyCache[id] = [2]string{requestBody, responseBody}
+	bodyCacheBytes += size
+}
+
+// cachedBody 读取尚未落盘的正文; 未命中表示该记录已落盘或从未存在。
+func cachedBody(id uint64, response bool) (string, bool) {
+	bodyCacheMu.Lock()
+	defer bodyCacheMu.Unlock()
+	bodies, ok := bodyCache[id]
+	if !ok {
+		return "", false
+	}
+	if response {
+		return bodies[1], true
+	}
+	return bodies[0], true
+}
+
+// dropCachedBody 在正文落盘后释放缓存, 避免长期占用内存。
+func dropCachedBody(ids []uint64) {
+	if len(ids) == 0 {
+		return
+	}
+	bodyCacheMu.Lock()
+	defer bodyCacheMu.Unlock()
+	for _, id := range ids {
+		if bodies, ok := bodyCache[id]; ok {
+			bodyCacheBytes -= int64(len(bodies[0]) + len(bodies[1]))
+			delete(bodyCache, id)
+		}
+	}
+}
+
+// clearBodyCache 在清空日志时一并丢弃待落盘正文。
+func clearBodyCache() {
+	bodyCacheMu.Lock()
+	defer bodyCacheMu.Unlock()
+	bodyCache = make(map[uint64][2]string)
+	bodyCacheBytes = 0
+}
+
 // InitStore 准备正文目录并记录根路径; 目录不可用时日志仍可只走内存, 故失败只告警。
 func InitStore(root string) {
 	logRoot = root
@@ -151,6 +215,8 @@ func StopStore() error {
 
 // enqueuePersist 把一条已结束的请求放进待落盘缓冲; 攒够一批或超过内存上限时立刻触发写盘。
 func enqueuePersist(record model.RelayLog, requestBody, responseBody string) {
+	// 先登记正文再入队: 详情读取可能紧接着请求结束发生, 缓存必须先可见。
+	cacheBody(record.ID, requestBody, responseBody)
 	pendingMu.Lock()
 	pending = append(pending, persistTask{record: record, requestBody: requestBody, responseBody: responseBody})
 	pendingBytes += int64(len(requestBody) + len(responseBody))
@@ -199,7 +265,14 @@ func persistBatch(batch []persistTask) {
 	}
 	if err := database.CreateInBatches(&records, persistInsertSize).Error; err != nil {
 		log.Warnf("failed to persist %d relay logs: %v", len(records), err)
+		return
 	}
+	// 落盘成功才释放缓存: 写库失败时保留正文, 详情仍可读且下次 flush 会重试写入。
+	persisted := make([]uint64, 0, len(records))
+	for _, record := range records {
+		persisted = append(persisted, record.ID)
+	}
+	dropCachedBody(persisted)
 }
 
 // RestoreRecent 把最近若干条记录读回内存, 使重启后的日志页仍能看到历史。
@@ -282,19 +355,25 @@ func ListPersisted(before uint64, limit int) ([]model.RelayLog, error) {
 }
 
 // readPersistedBody 按记录里的路径读取正文; 记录不存在或未留存正文时返回空串。
-func readPersistedBody(id uint64, response bool) string {
+// readPersistedBody 读取一条正文, 第二个返回值表示该记录是否存在。
+// 先查未落盘缓存: 批量写盘有最长 30 秒的等待窗口, 只读数据库会在这段时间返回空串,
+// 让调用方误以为内容为空。记录存在但正文为空(如上游返回空体)时返回 ("", true)。
+func readPersistedBody(id uint64, response bool) (string, bool) {
+	if body, ok := cachedBody(id, response); ok {
+		return body, true
+	}
 	database := db.GetDB()
 	if database == nil {
-		return ""
+		return "", false
 	}
 	var record model.RelayLog
 	if err := database.Select("request_body_path", "response_body_path").First(&record, id).Error; err != nil {
-		return ""
+		return "", false
 	}
 	if response {
-		return readBody(record.ResponseBodyPath)
+		return readBody(record.ResponseBodyPath), true
 	}
-	return readBody(record.RequestBodyPath)
+	return readBody(record.RequestBodyPath), true
 }
 
 // StartLogJanitor 定期裁剪历史; 首次在启动后立即跑一次, 把上次停机期间过期的记录清掉。
@@ -412,6 +491,7 @@ func bodyDiskUsage() int64 {
 
 // ClearPersisted 删除全部历史记录与正文文件, 供手动清空使用。
 func ClearPersisted() {
+	clearBodyCache()
 	database := db.GetDB()
 	if database == nil {
 		return

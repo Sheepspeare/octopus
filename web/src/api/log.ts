@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
-import { apiRequest } from './client';
+import { apiRequest, ApiError } from './client';
 
 // RequestState 表示 Relay 请求的实时状态。
 export type RequestState = 'running' | 'committed' | 'success' | 'failed' | 'canceled';
@@ -138,12 +138,21 @@ export function useLogHistory() {
     return { older, load, isLoading, exhausted };
 }
 
+// bodyRetry 对"正文尚未就绪"的 404 做短暂重试。
+// 记录刚结束时正文可能还在待落盘队列里, 后端会以 404 区分"还没有"与"内容为空";
+// 配合 staleTime: Infinity, 若把空结果缓存下来, 弹窗会一直显示无内容。
+function bodyRetry(failureCount: number, error: unknown) {
+    return error instanceof ApiError && error.status === 404 && failureCount < 5;
+}
+
 // useLogRequestBody 在调用方启用时按需获取指定日志的请求体。
 export function useLogRequestBody(id: number, startedAt: string, enabled: boolean) {
     return useQuery({
         queryKey: ['logs', id, startedAt, 'request-body'],
         queryFn: () => apiRequest<string>(`/api/v1/log/request-body/${id}`),
         enabled,
+        retry: bodyRetry,
+        retryDelay: 1000,
         staleTime: Infinity,
     });
 }
@@ -154,6 +163,8 @@ export function useLogResponseBody(id: number, startedAt: string, enabled: boole
         queryKey: ['logs', id, startedAt, 'response-body'],
         queryFn: () => apiRequest<string>(`/api/v1/log/response-body/${id}`),
         enabled,
+        retry: bodyRetry,
+        retryDelay: 1000,
         staleTime: Infinity,
     });
 }
