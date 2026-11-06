@@ -81,6 +81,10 @@ function MemberItem({
     const { Icon, className: iconClassName } = getModelIcon(member.name);
     const [confirmDelete, setConfirmDelete] = useState(false);
     const isDisabled = member.enabled === false;
+    // 在途数来自分组实时状态，未上报或没有在途请求时按 0 计。
+    const inflight = (member.item_id !== undefined && group?.runtime.inflight?.[member.item_id]) || 0;
+    // 占满时高亮：上限是否配得偏小，看这一眼就够了。
+    const concurrencyFull = member.max_concurrency > 0 && inflight >= member.max_concurrency;
 
     return (
         <div
@@ -153,7 +157,7 @@ function MemberItem({
 
                 {group && <MemberStatus group={group} itemId={member.item_id} now={now} active={isActive} activeClassName="p-1" />}
 
-                {/* 并发上限既是硬闸门也是加权模式的权重，编辑态直接改，只读态仅在配置过时以角标展示。 */}
+                {/* 并发上限既是硬闸门也是加权模式的权重，编辑态直接改，只读态展示"已占用/上限"。 */}
                 {concurrencyEditable && onConcurrencyChange ? (
                     <Tooltip>
                         <TooltipTrigger asChild>
@@ -161,6 +165,7 @@ function MemberItem({
                                 type="number"
                                 inputMode="numeric"
                                 min={0}
+                                max={4096}
                                 step={1}
                                 value={member.max_concurrency}
                                 aria-label={t('form.concurrency')}
@@ -168,7 +173,7 @@ function MemberItem({
                                 onKeyDown={(event) => event.stopPropagation()}
                                 onChange={(event) => {
                                     const value = Number.parseInt(event.target.value, 10);
-                                    onConcurrencyChange(member.id, Number.isFinite(value) && value > 0 ? value : 0);
+                                    onConcurrencyChange(member.id, Number.isFinite(value) && value > 0 ? Math.min(value, 4096) : 0);
                                 }}
                                 className="h-6 w-11 shrink-0 rounded-md border border-border/60 bg-background px-1 text-center text-xs tabular-nums outline-none focus-visible:border-border"
                             />
@@ -178,9 +183,34 @@ function MemberItem({
                         </TooltipContent>
                     </Tooltip>
                 ) : member.max_concurrency > 0 ? (
-                    <span className="shrink-0 rounded border border-border/60 px-1 text-[10px] leading-4 text-muted-foreground tabular-nums">
-                        {member.max_concurrency}
-                    </span>
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <span
+                                className={cn(
+                                    'shrink-0 rounded border px-1 text-[10px] leading-4 tabular-nums',
+                                    concurrencyFull
+                                        ? 'border-amber-500/60 text-amber-600 dark:text-amber-400'
+                                        : 'border-border/60 text-muted-foreground'
+                                )}
+                            >
+                                {inflight}/{member.max_concurrency}
+                            </span>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" sideOffset={10} align="center">
+                            {t('form.concurrencyUsage', { inflight, limit: member.max_concurrency })}
+                        </TooltipContent>
+                    </Tooltip>
+                ) : inflight > 0 ? (
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <span className="shrink-0 rounded border border-border/60 px-1 text-[10px] leading-4 text-muted-foreground tabular-nums">
+                                {inflight}
+                            </span>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" sideOffset={10} align="center">
+                            {t('form.concurrencyUsageUnlimited', { inflight })}
+                        </TooltipContent>
+                    </Tooltip>
                 ) : null}
 
                 {!group && (

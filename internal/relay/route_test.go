@@ -397,12 +397,12 @@ func TestPickReturnsZeroWhenAllMembersFull(t *testing.T) {
 	}
 }
 
-// TestGroupSaturatedDetectsFullMembers 验证满员能被识别出来, 归还槽位后立即恢复。
+// TestGroupBrieflyBlockedDetectsFullMembers 验证满员能被识别出来, 归还槽位后立即恢复。
 // 这个判定决定调用方是走亚秒级轮询还是走冷却等待, 判错会把吞吐压下去。
-func TestGroupSaturatedDetectsFullMembers(t *testing.T) {
+func TestGroupBrieflyBlockedDetectsFullMembers(t *testing.T) {
 	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{1, 1})
 
-	if groupSaturated(group, nil) {
+	if groupBrieflyBlocked(group, nil) {
 		t.Fatalf("还有余量时不应判为满员")
 	}
 	if item := pickGroupItem(group, nil); item.ID == 0 {
@@ -411,17 +411,17 @@ func TestGroupSaturatedDetectsFullMembers(t *testing.T) {
 	if item := pickGroupItem(group, nil); item.ID == 0 {
 		t.Fatalf("第二个成员应还有余量")
 	}
-	if !groupSaturated(group, nil) {
+	if !groupBrieflyBlocked(group, nil) {
 		t.Fatalf("全部成员占满后应判为满员")
 	}
 	ReleaseItemSlot(group.ID, 1)
-	if groupSaturated(group, nil) {
+	if groupBrieflyBlocked(group, nil) {
 		t.Fatalf("归还一个槽位后不应再判为满员")
 	}
 }
 
-// TestGroupSaturatedIgnoresCoolingMembers 验证冷却中的成员不算"满员", 等待时长仍交给冷却到期时间决定。
-func TestGroupSaturatedIgnoresCoolingMembers(t *testing.T) {
+// TestGroupBrieflyBlockedIgnoresCoolingMembers 验证冷却中的成员不算"满员", 等待时长仍交给冷却到期时间决定。
+func TestGroupBrieflyBlockedIgnoresCoolingMembers(t *testing.T) {
 	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{4, 4})
 	pickAndRelease(group) // 先建立路由状态, 冷却表才有地方可写。
 	for _, id := range []int{1, 2} {
@@ -430,13 +430,13 @@ func TestGroupSaturatedIgnoresCoolingMembers(t *testing.T) {
 		}
 	}
 
-	if groupSaturated(group, nil) {
+	if groupBrieflyBlocked(group, nil) {
 		t.Fatalf("全部成员都在冷却时不应判为满员")
 	}
 }
 
-// TestGroupSaturatedSkipsExcludedMembers 验证被排除的成员不计入满员判定。
-func TestGroupSaturatedSkipsExcludedMembers(t *testing.T) {
+// TestGroupBrieflyBlockedSkipsExcludedMembers 验证被排除的成员不计入满员判定。
+func TestGroupBrieflyBlockedSkipsExcludedMembers(t *testing.T) {
 	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{1, 1})
 
 	for range 2 {
@@ -445,13 +445,168 @@ func TestGroupSaturatedSkipsExcludedMembers(t *testing.T) {
 		}
 	}
 	// 两个成员都已占满, 排除谁都是满员。
-	if !groupSaturated(group, map[int]bool{2: true}) {
+	if !groupBrieflyBlocked(group, map[int]bool{2: true}) {
 		t.Fatalf("排除成员 2 后成员 1 仍满员, 应判为满员")
 	}
 	// 成员 2 腾出槽位后再排除成员 1, 判定就该看到成员 2 的余量。
 	ReleaseItemSlot(group.ID, 2)
-	if groupSaturated(group, map[int]bool{1: true}) {
+	if groupBrieflyBlocked(group, map[int]bool{1: true}) {
 		t.Fatalf("成员 2 已有余量, 不应判为满员")
+	}
+}
+
+// expireCooldown 把成员的冷却截止时间挪到过去, 模拟冷却刚到期但尚未验证恢复的状态。
+func expireCooldown(groupID, itemID int) {
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	if route := routes[groupID]; route != nil {
+		route.Cooldowns[itemID] = time.Now().UnixMilli() - 1000
+	}
+}
+
+// probeOccupant 返回当前占用探测名额的成员 ID, 供用例断言探测名额的发放与回收。
+func probeOccupant(groupID int) int {
+	routeMu.Lock()
+	defer routeMu.Unlock()
+
+	if route := routes[groupID]; route != nil {
+		return route.ProbeItemID
+	}
+	return 0
+}
+
+// TestPickWeightedProbesExpiredCoolingMember 验证冷却到期后只放一个探测请求, 其余请求继续走正常成员。
+// 不这么做的话, 到期瞬间该成员会带着全部权重一次性涌入, 上限高于上游真实配额时立刻再次 429。
+func TestPickWeightedProbesExpiredCoolingMember(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{8, 8})
+	pickAndRelease(group) // 建立路由状态。
+	if !recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 0) {
+		t.Fatalf("成员 2 应进入冷却")
+	}
+	expireCooldown(group.ID, 2)
+
+	probe := pickGroupItem(group, nil)
+	if probe.ID != 2 {
+		t.Fatalf("冷却到期后应优先放行成员 2 的探测请求, 实际选中 %d", probe.ID)
+	}
+	if occupant := probeOccupant(group.ID); occupant != 2 {
+		t.Fatalf("探测名额应记在成员 2 上, 实际 %d", occupant)
+	}
+	// 探测未出结论前, 后续请求不得再落到成员 2。
+	for range 8 {
+		item := pickGroupItem(group, nil)
+		if item.ID != 1 {
+			t.Fatalf("探测期间请求应全部走成员 1, 实际选中 %d", item.ID)
+		}
+		ReleaseItemSlot(group.ID, item.ID)
+	}
+	// 探测成功后该成员回到正常分配。
+	recordRouteSuccess(group, 2)
+	ReleaseItemSlot(group.ID, 2)
+	seen := map[int]bool{}
+	for range 16 {
+		item := pickGroupItem(group, nil)
+		seen[item.ID] = true
+		ReleaseItemSlot(group.ID, item.ID)
+	}
+	if !seen[2] {
+		t.Fatalf("探测成功后成员 2 应回到分配序列")
+	}
+}
+
+// TestPickRoundRobinProbesExpiredCoolingMember 验证轮询模式同样只放一个探测请求。
+func TestPickRoundRobinProbesExpiredCoolingMember(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeRoundRobin, []int{1, 2}, []int{8, 8})
+	pickAndRelease(group)
+	if !recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 0) {
+		t.Fatalf("成员 2 应进入冷却")
+	}
+	expireCooldown(group.ID, 2)
+
+	if probe := pickGroupItem(group, nil); probe.ID != 2 {
+		t.Fatalf("冷却到期后应优先放行成员 2 的探测请求, 实际选中 %d", probe.ID)
+	}
+	for range 6 {
+		item := pickGroupItem(group, nil)
+		if item.ID != 1 {
+			t.Fatalf("探测期间请求应全部走成员 1, 实际选中 %d", item.ID)
+		}
+		ReleaseItemSlot(group.ID, item.ID)
+	}
+}
+
+// TestProbeFailureRecoolsMember 验证探测失败会重新冷却, 不会让坏成员在到期后被反复涌入。
+func TestProbeFailureRecoolsMember(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{8, 8})
+	pickAndRelease(group)
+	recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 0)
+	expireCooldown(group.ID, 2)
+
+	if probe := pickGroupItem(group, nil); probe.ID != 2 {
+		t.Fatalf("应放行成员 2 的探测请求")
+	}
+	// 探测请求只有一次机会: 失败即重新冷却, 而不是按 member_max_attempts 再试一次。
+	if !recordRouteFailure(group, 2, 1, 0) {
+		t.Fatalf("探测失败应立即重新冷却成员 2")
+	}
+	if occupant := probeOccupant(group.ID); occupant != 0 {
+		t.Fatalf("探测失败后应释放探测名额, 实际 %d", occupant)
+	}
+	for range 6 {
+		item := pickGroupItem(group, nil)
+		if item.ID != 1 {
+			t.Fatalf("重新冷却后请求应全部走成员 1, 实际选中 %d", item.ID)
+		}
+		ReleaseItemSlot(group.ID, item.ID)
+	}
+}
+
+// TestGroupBrieflyBlockedWhenProbePending 验证"冷却已到期但探测名额被占"判为瞬时阻塞, 走亚秒级轮询。
+// 判成非瞬时的话调用方会按重试间隔(默认 3 秒)睡, 探测结束后的恢复要多等一个重试周期。
+func TestGroupBrieflyBlockedWhenProbePending(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{8, 8})
+	pickAndRelease(group)
+	recordRouteFailure(group, 1, group.RelayConfig.MemberMaxAttempts, 0)
+	recordRouteFailure(group, 2, group.RelayConfig.MemberMaxAttempts, 0)
+
+	// 冷却还没到期: 不是瞬时阻塞, 等待时长交给冷却到期时间决定。
+	if groupBrieflyBlocked(group, nil) {
+		t.Fatalf("冷却未到期时不应判为瞬时阻塞")
+	}
+
+	expireCooldown(group.ID, 1)
+	expireCooldown(group.ID, 2)
+	if probe := pickGroupItem(group, nil); probe.ID == 0 {
+		t.Fatalf("应放行一个探测请求")
+	}
+	// 另一个成员冷却也到期了, 但探测名额被占, 只能等一次探测往返。
+	if !groupBrieflyBlocked(group, nil) {
+		t.Fatalf("等探测名额属于瞬时阻塞, 应走亚秒级轮询")
+	}
+}
+
+// TestRouteStateDropsRemovedMemberCounters 验证成员被删除后, 在途数与累计权重不留在路由状态里。
+// 留着的话成员 ID 被新成员复用时, 新成员会带着别人的权重起跑, 前几轮分配明显偏斜。
+func TestRouteStateDropsRemovedMemberCounters(t *testing.T) {
+	group := newLimitedGroup(t, model.GroupModeWeighted, []int{1, 2}, []int{4, 4})
+	for range 2 {
+		if item := pickGroupItem(group, nil); item.ID == 0 {
+			t.Fatalf("两个成员各有余量, 应都能选中")
+		}
+	}
+	// 只保留成员 1, 成员 2 视为已从分组删除。
+	trimmed := group
+	trimmed.Items = []model.GroupItem{group.Items[0]}
+
+	routeMu.Lock()
+	route := groupRouteLocked(trimmed)
+	_, hasInflight := route.inflight[2]
+	_, hasWeight := route.weights[2]
+	routeMu.Unlock()
+
+	if hasInflight || hasWeight {
+		t.Fatalf("已删除成员的在途数与权重都应清理, 残留 inflight=%v weights=%v", hasInflight, hasWeight)
 	}
 }
 

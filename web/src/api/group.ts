@@ -42,6 +42,8 @@ export interface GroupRuntime {
     probe_item_id: number;
     affinity_until: number;
     cooldowns: Record<number, number>;
+    // 各成员当前在途请求数，键是成员 ID；没有在途请求的成员不出现。用于显示"已占用/上限"。
+    inflight?: Record<number, number>;
 }
 
 // Group 是客户端模型名称对应的渠道分组。

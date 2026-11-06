@@ -116,5 +116,6 @@ type GroupUpdateRequest struct {
 type GroupItemInput struct {
 	ChannelGrantID int `json:"channel_grant_id" binding:"required"` // 待引用的渠道授权 ID。
 	// MaxConcurrency 是该成员的并发上限, 0 表示不限; 加权模式同时用它作权重, 留空按组内最大上限参与分配。
-	MaxConcurrency int `json:"max_concurrency" binding:"omitempty,min=0"`
+	// 上限给到四位数以上等于没有闸门, 只会让误填(例如把毫秒数写进来)失去提示, 故设一个够用的上界。
+	MaxConcurrency int `json:"max_concurrency" binding:"omitempty,min=0,max=4096"`
 }

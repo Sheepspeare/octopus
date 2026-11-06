@@ -19,10 +19,13 @@ type RouteState struct {
 	ProbeItemID   int           `json:"probe_item_id"`   // 当前占用恢复探测的成员 ID, 同一分组同时只允许一个成员被探测; 手动模式恒为 0。
 	AffinityUntil int64         `json:"affinity_until"`  // 当前路由的亲和截止 Unix 毫秒时间, 0 表示无亲和; 手动模式恒为 0。
 	Cooldowns     map[int]int64 `json:"cooldowns"`       // 失败成员 ID 对应的冷却截止 Unix 毫秒时间, 已到期的条目由前端按当前时间忽略。
+	// Inflight 是各成员当前在途请求数的快照, 供界面显示"已占用/上限"并据此判断上限配得合不合适。
+	// 它只在发布时按值复制, 内部计数由未导出的 inflight 维护: 直接导出内部 map 会让读 JSON 的协程与选路并发读写同一张表。
+	Inflight map[int]int `json:"inflight,omitempty"`
 
 	affinityArmed bool // 当前路由下一次成功后是否开始亲和, 仅故障切换后为真。
 	// inflight 记录每个成员当前在途的请求数, 用于执行成员的并发上限; 未配置上限的成员同样计数, 便于排障。
-	// 只在持有 routeMu 时读写, 不导出到 JSON: 前端展示的实时状态不含在途数。
+	// 只在持有 routeMu 时读写; 对外展示走发布时复制的 Inflight 快照。
 	inflight map[int]int
 	// weights 是加权轮询的平滑累计权重: 每轮给候选成员加上自身权重, 被选中的成员减去本轮总权重。
 	// 这样既保持长期比例精确, 又不会像固定窗口那样把同一成员的请求挤在一起。
@@ -62,6 +65,7 @@ func RouteStateOf(group model.Group) RouteState {
 	}
 	state := *route
 	state.Cooldowns = maps.Clone(route.Cooldowns)
+	state.Inflight = maps.Clone(route.inflight)
 	return state
 }
 
@@ -160,6 +164,38 @@ func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 	return model.GroupItem{}
 }
 
+// pickProbeLocked 为冷却刚到期、尚未验证恢复的成员放行一个探测请求。
+// 轮询与加权模式原先只按并发上限放行, 冷却一到期的成员会连同全部权重一次性涌入:
+// 上限配得比上游真实配额高时(例如单 key 配额 8 却填了 12), 恢复瞬间就被打爆, 立刻再次 429 并重新冷却,
+// 形成"恢复-打爆-再冷却"的周期性抖动。改为到期只放一个请求探路, 结果由 recordRouteSuccess/Failure
+// 清除 ProbeItemID: 成功则该成员回到正常池, 失败则重新冷却, 代价只是一个请求的往返。
+// 同一分组同时只允许一个成员被探测, 多个成员同时到期时按配置顺序串行恢复。
+// 调用方必须持有 routeMu。
+func pickProbeLocked(group model.Group, route *RouteState, now int64, exclude map[int]bool) model.GroupItem {
+	if route.ProbeItemID != 0 {
+		return model.GroupItem{}
+	}
+	for _, item := range group.Items {
+		if exclude[item.ID] {
+			continue
+		}
+		deadline, cooling := route.Cooldowns[item.ID]
+		if !cooling || deadline > now {
+			continue
+		}
+		// 满员说明该成员还有正常请求在跑, 槽位释放后自然回到候选, 不需要额外探测。
+		if !itemHasSlot(route, item) {
+			continue
+		}
+		route.ProbeItemID = item.ID
+		route.CurrentItemID = item.ID
+		reserveItemLocked(route, item)
+		publishRouteLocked(route)
+		return item
+	}
+	return model.GroupItem{}
+}
+
 // pickRoundRobinLocked 从当前成员的下一个开始轮转, 跳过冷却中与本请求已排除的成员, 使请求按成员顺序均匀分摊。
 // 全部成员都不可选时返回零值: 交给调用方按重试间隔等待, 比对着已知失败的成员空转更省资源,
 // 冷却到期后成员会自动回到轮转序列。
@@ -167,6 +203,10 @@ func pickGroupItem(group model.Group, exclude map[int]bool) model.GroupItem {
 func pickRoundRobinLocked(group model.Group, route *RouteState, now int64, exclude map[int]bool) model.GroupItem {
 	if len(group.Items) == 0 {
 		return model.GroupItem{}
+	}
+	// 冷却到期的成员先放一个探测请求, 成功后才回到轮转序列。
+	if item := pickProbeLocked(group, route, now, exclude); item.ID != 0 {
+		return item
 	}
 	start := 0
 	for index, item := range group.Items {
@@ -180,7 +220,8 @@ func pickRoundRobinLocked(group model.Group, route *RouteState, now int64, exclu
 		if exclude[item.ID] {
 			continue
 		}
-		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
+		// 冷却中的成员不参与; 已到期的由 pickProbeLocked 单独放行, 探测名额被别的成员占用时同样跳过。
+		if _, cooling := route.Cooldowns[item.ID]; cooling {
 			continue
 		}
 		// 满员的成员本轮让位: 游标继续推进, 它的份额临时由后面的成员承接。
@@ -200,13 +241,19 @@ func pickRoundRobinLocked(group model.Group, route *RouteState, now int64, exclu
 // 满员与冷却中的成员不参与本轮累计, 它们的份额自然落到仍有余量的成员身上; 全部满员时返回零值交给调用方等待。
 // 调用方必须持有 routeMu。
 func pickWeightedLocked(group model.Group, route *RouteState, now int64, exclude map[int]bool) model.GroupItem {
+	// 冷却到期的成员先放一个探测请求, 成功后才带着权重回到正常分配。
+	if item := pickProbeLocked(group, route, now, exclude); item.ID != 0 {
+		return item
+	}
+
 	total := 0
 	chosen := model.GroupItem{}
 	for _, item := range group.Items {
 		if exclude[item.ID] {
 			continue
 		}
-		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
+		// 冷却中的成员不参与; 已到期的由 pickProbeLocked 单独放行, 探测名额被别的成员占用时同样跳过。
+		if _, cooling := route.Cooldowns[item.ID]; cooling {
 			continue
 		}
 		if !itemHasSlot(route, item) {
@@ -280,6 +327,9 @@ func ReleaseItemSlot(groupID, itemID int) {
 		route.inflight[itemID] = inflight - 1
 	case inflight == 1:
 		delete(route.inflight, itemID)
+		// 归零后不会再有选路事件把在途数带出去, 这里主动发布一次, 否则界面会停在最后占用的那个数字上。
+		// 中间值不必发布: 每次选路都会带出全量在途数, 有流量时它自然是新的。
+		publishRouteLocked(route)
 	}
 }
 
@@ -302,29 +352,32 @@ func allItemsExcluded(group model.Group, exclude map[int]bool) bool {
 // 否则人工改配置(切渠道, 补成员, 关冷却)要等到冷却到期才生效。
 const cooldownWaitLimit = 10 * time.Second
 
-// groupSaturated 判断"本轮没有可选成员"是否因为成员的并发上限已满, 而不是冷却或成员被排除。
-// 满员是瞬时的: 槽位通常在一两个请求的耗时内就会腾出, 调用方据此改用亚秒级短等待;
-// 有成员在冷却时返回 false, 等待时长仍由冷却到期时间决定。
-func groupSaturated(group model.Group, exclude map[int]bool) bool {
+// groupBrieflyBlocked 判断"本轮没有可选成员"是不是只是瞬时阻塞, 调用方据此改用亚秒级短等待。
+// 两种成因都算瞬时: 成员的并发上限已满(槽位通常在一两个请求的耗时内腾出), 以及成员冷却已到期
+// 但探测名额正被别的成员占用(等一次探测往返即可)。有成员仍在冷却期内时返回 false,
+// 等待时长交给冷却到期时间决定, 免得按 100 毫秒空转到冷却结束。
+func groupBrieflyBlocked(group model.Group, exclude map[int]bool) bool {
 	routeMu.Lock()
 	defer routeMu.Unlock()
 
 	route := groupRouteLocked(group)
 	now := time.Now().UnixMilli()
-	considered := false
+	blocked := false
 	for _, item := range group.Items {
 		if exclude[item.ID] {
 			continue
 		}
-		if deadline, cooling := route.Cooldowns[item.ID]; cooling && deadline > now {
+		deadline, cooling := route.Cooldowns[item.ID]
+		if cooling && deadline > now {
 			continue
 		}
-		considered = true
-		if itemHasSlot(route, item) {
+		blocked = true
+		// 冷却已到期的成员要等探测名额, 不算"立刻可用"; 只有完全干净的成员才算。
+		if !cooling && itemHasSlot(route, item) {
 			return false
 		}
 	}
-	return considered
+	return blocked
 }
 
 // routeWaitSeconds 决定"本轮没有可选成员"时该等多久。
@@ -555,6 +608,18 @@ func groupRouteLocked(group model.Group) *RouteState {
 			delete(route.provisional, itemID)
 		}
 	}
+	// 在途数与累计权重同样按成员清理: 成员删除后若不清理, 累计权重会一直留在表里,
+	// 成员 ID 被新成员复用时新成员会带着别人的权重起跑, 前几轮分配明显偏斜。
+	for itemID := range route.inflight {
+		if !items[itemID] {
+			delete(route.inflight, itemID)
+		}
+	}
+	for itemID := range route.weights {
+		if !items[itemID] {
+			delete(route.weights, itemID)
+		}
+	}
 	if route.ProbeItemID != 0 && !items[route.ProbeItemID] {
 		route.ProbeItemID = 0
 	}
@@ -578,8 +643,12 @@ func itemOf(group model.Group, itemID int) model.GroupItem {
 
 // publishRouteLocked 非阻塞发布路由状态, 连接拥塞时关闭它并交给客户端重连获取全量快照; 冷却表按值复制以免前端读到后续变更; 调用方必须持有锁。
 func publishRouteLocked(route *RouteState) {
+	if len(routeStreams) == 0 {
+		return
+	}
 	message := *route
 	message.Cooldowns = maps.Clone(route.Cooldowns)
+	message.Inflight = maps.Clone(route.inflight)
 	for stream := range routeStreams {
 		select {
 		case stream <- message:
